@@ -84,7 +84,14 @@ async def lifespan(app: FastAPI):
         migrations_dir = Path(__file__).parent / "migrations"
         await run_migrations(db, migrations_dir)
 
+        # Process-wide upstream client (Plan §16.2). ``trust_env=False``
+        # prevents ``HTTP_PROXY``/``HTTPS_PROXY``/``ALL_PROXY``/``NO_PROXY``
+        # env vars from redirecting loopback editor traffic through an
+        # unrelated forward proxy. ``follow_redirects=False`` keeps the
+        # proxy from chasing upstream 3xx responses. Explicit Timeouts
+        # and Limits cap resource use (HI-06).
         http_client = httpx.AsyncClient(
+            trust_env=False,
             timeout=httpx.Timeout(
                 connect=settings.proxy_connect_timeout,
                 read=settings.proxy_read_timeout,

@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from collections.abc import AsyncIterator
 from contextlib import suppress
 from typing import Any
 
 import httpx
+from starlette.background import BackgroundTask
 from starlette.requests import Request
 from starlette.responses import StreamingResponse
 from starlette.websockets import WebSocket
@@ -25,6 +27,19 @@ HOP_BY_HOP_HEADERS: frozenset[str] = frozenset(
         "upgrade",
     }
 )
+
+# Gateway-specific request headers that must never be forwarded
+# upstream. The editor never needs them and forwarding them would leak
+# gateway auth/plumbing material (Plan §16.2).
+GATEWAY_REQUEST_HEADER_BLOCKLIST: frozenset[str] = frozenset(
+    {
+        "x-csrf-token",
+    }
+)
+
+# Gateway session cookie name(s). Upstream editor cookies are preserved;
+# only the gateway's own auth cookie is stripped (Plan §16.2).
+GATEWAY_COOKIE_NAMES: frozenset[str] = frozenset({"gateway_session"})
 
 
 class ProxyRegistry:
@@ -86,15 +101,66 @@ class ProxyAdapter:
             url = f"{url}?{query}"
         return url
 
-    def filter_request_headers(self, headers: dict[str, str]) -> dict[str, str]:
-        return {
-            k: v
-            for k, v in headers.items()
-            if k.lower() not in HOP_BY_HOP_HEADERS and k.lower() != "cookie"
-        }
+    def filter_request_headers(
+        self,
+        headers: Any,
+    ) -> list[tuple[str, str]]:
+        """Return multi-value request headers safe to forward upstream.
 
-    def filter_response_headers(self, headers: dict[str, str]) -> dict[str, str]:
-        return {k: v for k, v in headers.items() if k.lower() not in HOP_BY_HOP_HEADERS}
+        Drops hop-by-hop headers, gateway-only headers, and the gateway
+        auth cookie from the ``Cookie`` header. Other cookies (editor
+        cookies etc.) are preserved (Plan §16.2).
+        """
+        out: list[tuple[str, str]] = []
+        # Starlette's ``Headers.items()`` returns each repeated header as
+        # its own ``(name, value)`` pair (multi-value aware) so the
+        # downstream `Cookie` plus other repeated headers are preserved.
+        for key, value in headers.items():
+            lk = key.lower()
+            if lk in HOP_BY_HOP_HEADERS:
+                continue
+            if lk in GATEWAY_REQUEST_HEADER_BLOCKLIST:
+                continue
+            # httpx recomputes Content-Length or uses chunked encoding
+            # based on the streamed request body; the downstream value
+            # could conflict with the chosen transfer encoding and must
+            # not be forwarded.
+            if lk == "content-length":
+                continue
+            if lk == "cookie":
+                value = self._strip_gateway_cookies(value)
+                if not value:
+                    continue
+            out.append((key, value))
+        return out
+
+    @staticmethod
+    def _strip_gateway_cookies(cookie_header: str) -> str:
+        parts: list[str] = []
+        for part in cookie_header.split(";"):
+            part = part.strip()
+            if not part:
+                continue
+            name = part.split("=", 1)[0].strip()
+            if name in GATEWAY_COOKIE_NAMES:
+                continue
+            parts.append(part)
+        return "; ".join(parts)
+
+    @staticmethod
+    def filter_upstream_response_raw_headers(
+        raw_headers: list[tuple[bytes, bytes]],
+    ) -> list[tuple[bytes, bytes]]:
+        """Drop hop-by-hop upstream response headers, preserving repeated
+        headers (e.g. several ``Set-Cookie``) by working on the raw
+        ``(name, value)`` byte-pair list rather than collapsing into a
+        dict.
+        """
+        return [
+            (name, value)
+            for name, value in raw_headers
+            if name.decode("latin-1").lower() not in HOP_BY_HOP_HEADERS
+        ]
 
     @staticmethod
     def _strip_base_trailing_slash(session_id: SessionId, path: str) -> str:
@@ -123,28 +189,26 @@ class ProxyAdapter:
 
         method = request.method or "GET"
 
-        headers = self.filter_request_headers(dict(request.headers))
-        headers["x-forwarded-proto"] = request.url.scheme
-        headers["x-forwarded-host"] = request.headers.get("host", "")
-        path_prefix = f"/editor/{session_id}"
-        headers["x-forwarded-prefix"] = path_prefix
+        forwarded = self.filter_request_headers(request.headers)
+        forwarded.append(("x-forwarded-proto", request.url.scheme))
+        forwarded.append(("x-forwarded-host", request.headers.get("host", "")))
+        forwarded.append(("x-forwarded-prefix", f"/editor/{session_id}"))
 
-        body = await request.body()
-        content = body if body else None
+        # Stream the downstream request body straight into the upstream
+        # request (Plan §16.2). httpx wraps the async generator in an
+        # ``AsyncIteratorByteStream`` and emits a chunked
+        # ``Transfer-Encoding`` header because the total length is
+        # unknown, so large uploads are forwarded without an in-memory
+        # copy on the gateway side.
+        req = self._http.build_request(
+            method=method,
+            url=upstream_url,
+            headers=forwarded,
+            content=request.stream(),
+        )
 
         try:
-            upstream_resp = await self._http.request(
-                method=method,
-                url=upstream_url,
-                headers=headers,
-                content=content,
-                timeout=httpx.Timeout(
-                    connect=self._http.timeout.connect,
-                    read=self._http.timeout.read,
-                    write=self._http.timeout.write,
-                    pool=self._http.timeout.pool,
-                ),
-            )
+            upstream_resp = await self._http.send(req, stream=True)
         except httpx.RequestError as exc:
             raise GatewayError(
                 ErrorCode.EDITOR_UNHEALTHY,
@@ -152,14 +216,35 @@ class ProxyAdapter:
                 status_code=502,
             ) from exc
 
-        response_headers = self.filter_response_headers(dict(upstream_resp.headers))
-
-        return StreamingResponse(
-            content=upstream_resp.aiter_bytes(),
-            status_code=upstream_resp.status_code,
-            headers=response_headers,
-            media_type=response_headers.get("content-type"),
+        # ``raw`` is the original ordered list of (name, value) byte
+        # pairs from the upstream response; using it preserves repeated
+        # headers (e.g. multiple ``Set-Cookie``) instead of collapsing
+        # them into a dict.
+        raw_response_headers = self.filter_upstream_response_raw_headers(
+            list(upstream_resp.headers.raw)
         )
+        content_type = upstream_resp.headers.get("content-type")
+
+        # A guaranteed background finalizer releases the upstream
+        # connection back to the pool even if the downstream client
+        # disconnects mid-stream before the body iterator is fully
+        # consumed (Plan §16.2; HI-06). ``aclose`` is idempotent in
+        # httpx, so the belt-and-suspenders close inside the body
+        # iterator (for graceful completion) is safe alongside this.
+        background = BackgroundTask(_aclose_response, upstream_resp)
+
+        response = StreamingResponse(
+            content=_iter_upstream(upstream_resp),
+            status_code=upstream_resp.status_code,
+            media_type=content_type,
+            background=background,
+        )
+        # Preserve raw multi-value upstream headers verbatim. Starlette's
+        # ``init_headers`` collapses a mapping's ``.items()`` so repeated
+        # headers (multiple ``Set-Cookie``) would be lost; assigning the
+        # raw list directly keeps them intact.
+        response.raw_headers = raw_response_headers
+        return response
 
     async def proxy_websocket(
         self,
@@ -270,3 +355,21 @@ class ProxyAdapter:
                     await downstream.send_bytes(message)
         except Exception:
             pass
+
+
+async def _iter_upstream(resp: httpx.Response) -> AsyncIterator[bytes]:
+    """Yield upstream response bytes lazily, releasing the upstream on
+    graceful exhaustion (Plan §16.2; HI-06)."""
+    try:
+        async for chunk in resp.aiter_bytes():
+            yield chunk
+    finally:
+        with suppress(Exception):
+            await resp.aclose()
+
+
+async def _aclose_response(resp: httpx.Response) -> None:
+    """Background finalizer that returns the upstream connection to the
+    pool even when the downstream client disconnects mid-stream."""
+    with suppress(Exception):
+        await resp.aclose()
