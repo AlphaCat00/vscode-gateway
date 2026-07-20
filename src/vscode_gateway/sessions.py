@@ -645,11 +645,25 @@ class SessionService:
                     )
                     failed += 1
 
+        # Compute unresolved counts for the readiness gate (Plan §15.4):
+        # * error_sessions_remaining — durable rows still in ``error``
+        #   after recovery, awaiting operator close/retry.
+        # * orphaned_resources_remaining — error rows whose remote
+        #   process identity is still persisted, i.e. a remote process
+        #   we could not safely prove absent.
+        remaining_after = await list_sessions(self._db)
+        error_sessions_remaining = sum(1 for r in remaining_after if r.state == SessionState.ERROR)
+        orphaned_resources_remaining = sum(
+            1 for r in remaining_after if r.state == SessionState.ERROR and r.remote_pid is not None
+        )
+
         return RecoveryReport(
             recovered=recovered,
             failed=failed,
             cleaned=cleaned,
             total=len(sessions),
+            error_sessions_remaining=error_sessions_remaining,
+            orphaned_resources_remaining=orphaned_resources_remaining,
         )
 
     async def reconcile_catalog(self, task_group: asyncio.TaskGroup) -> None:

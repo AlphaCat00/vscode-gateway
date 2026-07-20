@@ -192,3 +192,5 @@ class RecoveryReport(BaseModel):
     failed: int
     cleaned: int
     total: int
+    error_sessions_remaining: int = 0
+    orphaned_resources_remaining: int = 0

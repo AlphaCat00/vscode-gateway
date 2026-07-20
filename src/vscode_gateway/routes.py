@@ -33,6 +33,7 @@ from vscode_gateway.models import (
     VersionResponse,
 )
 from vscode_gateway.proxy import ProxyAdapter, ProxyRegistry
+from vscode_gateway.readiness import Readiness, ReadinessPhase
 from vscode_gateway.sessions import SessionService
 from vscode_gateway.settings import Settings
 from vscode_gateway.ssh import SshCatalog, compute_config_revision, validate_and_save_config
@@ -51,6 +52,32 @@ async def require_auth(request: Request) -> None:
 async def require_csrf(request: Request) -> None:
     if not verify_csrf(request):
         raise HTTPException(status_code=403, detail="Invalid CSRF token")
+
+
+def _require_ready(request: Request) -> None:
+    """Reject mutations and editor traffic while the gateway is not
+    ``ready``. Read-only routes (dashboard, lists, /healthz, the
+    top-level /readyz) bypass this check.
+
+    The check returns 503 with a problem+json body so load balancers
+    stop routing mutations and editors during startup and degraded
+    recovery (HI-04, Plan §10.3 / §15).
+    """
+    try:
+        readiness: Readiness = request.app.state.readiness
+    except AttributeError:
+        raise HTTPException(status_code=503, detail="Service is not ready") from None
+    if readiness.phase != ReadinessPhase.READY:
+        state = readiness.snapshot()
+        body = state.as_response_dict()
+        raise HTTPException(
+            status_code=503,
+            detail=body.get("reason") or "Service is not ready",
+        )
+
+
+async def require_ready(request: Request) -> None:
+    _require_ready(request)
 
 
 def _problem(exc: GatewayError, request_id: str) -> JSONResponse:
@@ -74,7 +101,9 @@ def create_routes(
     catalog: SshCatalog,
     proxy_adapter: ProxyAdapter,
     proxy_registry: ProxyRegistry,
+    readiness: Readiness,  # wired explicitly; routes read state from request.app.state
 ) -> APIRouter:
+    _ = readiness
     router = APIRouter()
     templates = _load_templates()
 
@@ -172,7 +201,7 @@ def create_routes(
             }
         )
 
-    @router.post("/api/sessions/{alias:path}/open")
+    @router.post("/api/sessions/{alias:path}/open", dependencies=[Depends(require_ready)])
     async def open_session(
         request: Request,
         alias: str,
@@ -192,7 +221,7 @@ def create_routes(
         except GatewayError as exc:
             return _problem(exc, str(uuid.uuid4()))
 
-    @router.post("/api/sessions/{alias:path}/close")
+    @router.post("/api/sessions/{alias:path}/close", dependencies=[Depends(require_ready)])
     async def close_session(
         request: Request,
         alias: str,
@@ -205,7 +234,7 @@ def create_routes(
         except GatewayError as exc:
             return _problem(exc, str(uuid.uuid4()))
 
-    @router.post("/api/sessions/{alias:path}/retry")
+    @router.post("/api/sessions/{alias:path}/retry", dependencies=[Depends(require_ready)])
     async def retry_session(
         request: Request,
         alias: str,
@@ -255,7 +284,7 @@ def create_routes(
             ).model_dump()
         )
 
-    @router.put("/api/ssh/config")
+    @router.put("/api/ssh/config", dependencies=[Depends(require_ready)])
     async def put_ssh_config(
         request: Request,
         body: SshConfigUpdateRequest,
@@ -331,7 +360,7 @@ def create_routes(
                     )
         return JSONResponse({"keys": keys})
 
-    @router.post("/api/ssh/keys")
+    @router.post("/api/ssh/keys", dependencies=[Depends(require_ready)])
     async def create_key(request: Request) -> JSONResponse:
         await require_auth.__call__(request)
         await require_csrf.__call__(request)
@@ -383,7 +412,7 @@ def create_routes(
         content = pub_path.read_text(encoding="utf-8")
         return PlainTextResponse(content)
 
-    @router.delete("/api/ssh/keys/{name}")
+    @router.delete("/api/ssh/keys/{name}", dependencies=[Depends(require_ready)])
     async def delete_key(request: Request, name: str) -> Response:
         await require_auth.__call__(request)
         await require_csrf.__call__(request)
@@ -405,10 +434,6 @@ def create_routes(
     async def healthz() -> JSONResponse:
         return JSONResponse({"status": "ok"})
 
-    @router.get("/readyz")
-    async def readyz() -> JSONResponse:
-        return JSONResponse({"status": "ok", "ready": True})
-
     @router.get("/api/version")
     async def version() -> JSONResponse:
         from vscode_gateway import __version__
@@ -419,6 +444,7 @@ def create_routes(
     @router.api_route(
         "/editor/{session_id}/{rest_of_path:path}",
         methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"],
+        dependencies=[Depends(require_ready)],
     )
     async def proxy_http_route(request: Request, session_id: str, rest_of_path: str):
         await require_auth.__call__(request)
@@ -427,6 +453,14 @@ def create_routes(
 
     @router.websocket("/editor/{session_id}/{rest_of_path:path}")
     async def proxy_ws_route(ws: WebSocket, session_id: str, rest_of_path: str):
+        # Readiness gate (HI-04): reject editor traffic while the gateway
+        # is starting, recovering, or degraded. Use a stable close code
+        # so the browser cannot infer internals.
+        readiness: Readiness | None = getattr(ws.app.state, "readiness", None)
+        if readiness is None or readiness.phase != ReadinessPhase.READY:
+            await ws.close(code=4503)
+            return
+
         # Per plan §16.3: authenticate before ``accept`` and before any
         # upstream connection. We reject with a stable close code so no
         # internals leak and no upstream contact occurs.
