@@ -301,6 +301,10 @@ class SessionService:
         self._connected_counts.pop(session_id, None)
 
     async def retry(self, alias: str) -> SessionView:
+        # Per plan §14.3: retry must never call public ``open()`` while
+        # holding the same non-reentrant alias lock. We synchronously
+        # establish cleanup safety inside the lock, release it, then call
+        # the public ``open()`` from outside.
         async with self._get_lock(alias):
             session = await get_session_by_alias(self._db, alias)
             if session is None:
@@ -316,16 +320,34 @@ class SessionService:
                     status_code=409,
                 )
 
-            # Tear down any lingering resources in the background; the row
-            # has already been removed so a fresh open() can run.
-            self._cancel_start(session.id)
+            # Cancel and *await* any residual start task so its cancellation
+            # cleanup contract completes before we touch resources. Never
+            # spawn a competing background close that could overlap with a
+            # new open.
+            start_task = self._start_tasks.pop(session.id, None)
+            if start_task is not None:
+                start_task.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await start_task
+
             self._cancel_grace(session.id)
             self._registry.remove(session.id)
-            await delete_session(self._db, str(session.id))
-            self._spawn(self._do_close(session))
-            with suppress(ValueError):
-                self._capacity_release()
 
+            # Run resource cleanup synchronously. ``_do_close`` is
+            # responsible for stopping owned tunnel/remote, deleting the
+            # row, and releasing capacity exactly once. If cleanup cannot
+            # prove absence it leaves the error row in place and re-raises.
+            try:
+                await self._do_close(session)
+            except Exception as exc:
+                raise GatewayError(
+                    ErrorCode.STOP_FAILED,
+                    f"Retry aborted: cleanup failed: {exc}",
+                    status_code=500,
+                ) from exc
+
+        # Old run safely closed; lock released. Open the fresh run through
+        # the public entry point so we never re-enter the alias lock.
         return await self.open(alias)
 
     async def recover_all(self) -> RecoveryReport:
@@ -617,9 +639,7 @@ class SessionService:
             t = self._spawn(self._grace_watcher(session_id, deadline))
             if t is not None:
                 self._grace_timers[session_id] = t
-            self._spawn(
-                set_disconnect_deadline(self._db, str(session_id), now, deadline)
-            )
+            self._spawn(set_disconnect_deadline(self._db, str(session_id), now, deadline))
             self._spawn(update_connected_clients(self._db, str(session_id), count))
 
     async def on_tunnel_exit(self, session_id: SessionId, return_code: int) -> None:

@@ -6,6 +6,7 @@ import hashlib
 import os
 import re
 import socket
+import tempfile
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -17,6 +18,34 @@ ALIAS_RE = re.compile(r"^\s*Host\s+(.+)$", re.IGNORECASE | re.MULTILINE)
 ALIAS_TOKEN_RE = re.compile(r"[a-zA-Z_][a-zA-Z0-9._\-]{0,252}")
 ALIAS_MAX_LENGTH = 253
 WILDCARD_CHARS = frozenset("*?[")
+
+# Directives that turn the dedicated gateway config into a command-execution or
+# forwarding tool. They are rejected before any candidate is committed, in
+# addition to syntax validation by ``ssh -G``.
+UNSAFE_DIRECTIVES: frozenset[str] = frozenset(
+    {
+        "include",
+        "match",
+        "proxycommand",
+        "localcommand",
+        "permitlocalcommand",
+        "remotecommand",
+        "localforward",
+        "remoteforward",
+        "dynamicforward",
+        "tunnel",
+        "canonicalizehostname",
+        "knownhostscommand",
+        "pkcs11provider",
+        "securitykeyprovider",
+    }
+)
+
+# Process-wide serial lock for config writes. Asyncio locks are safe to
+# construct without a running loop on Python 3.10+.
+_CONFIG_WRITE_LOCK = asyncio.Lock()
+
+_DIRECTIVE_LINE_RE = re.compile(r"^\s*([A-Za-z][A-Za-z0-9-]*)\s")
 
 
 async def run_process(
@@ -101,12 +130,30 @@ def discover_aliases(config_text: str) -> list[str]:
     return aliases
 
 
-async def validate_alias(settings: Settings, alias: str) -> bool:
+async def validate_alias(settings: Settings, alias: str, config_path: Path | None = None) -> bool:
+    candidate = config_path if config_path is not None else settings.ssh_config_path
     result = await run_process(
-        [settings.ssh_executable, "-F", str(settings.ssh_config_path), "-G", alias],
+        [settings.ssh_executable, "-F", str(candidate), "-G", alias],
         timeout=settings.subprocess_timeout,
     )
     return result.exit_code == 0
+
+
+def find_unsafe_directives(text: str) -> list[str]:
+    """Return the list of unsafe directives found in ``text`` (case-insensitive).
+
+    Only directive keywords at the start of a line are inspected. Values
+    (including ``Host`` tokens) are not interpreted as directives.
+    """
+    found: list[str] = []
+    for line in text.splitlines():
+        m = _DIRECTIVE_LINE_RE.match(line)
+        if m is None:
+            continue
+        keyword = m.group(1).lower()
+        if keyword in UNSAFE_DIRECTIVES:
+            found.append(keyword)
+    return found
 
 
 async def probe_capabilities(
@@ -272,66 +319,136 @@ async def validate_and_save_config(
     text: str,
     expected_revision: str | None = None,
 ) -> CatalogSnapshot:
+    from vscode_gateway.errors import ErrorCode, GatewayError
+
     config_path = settings.ssh_config_path
 
     if "\x00" in text:
-        from vscode_gateway.errors import ErrorCode, GatewayError
-
         raise GatewayError(
             ErrorCode.SSH_CONFIG_INVALID, "Config contains NUL bytes", status_code=400
         )
 
     try:
-        text.encode("utf-8")
+        encoded = text.encode("utf-8")
     except UnicodeEncodeError as exc:
-        from vscode_gateway.errors import ErrorCode, GatewayError
-
         raise GatewayError(
             ErrorCode.SSH_CONFIG_INVALID, "Config is not valid UTF-8", status_code=400
         ) from exc
 
-    if len(text.encode("utf-8")) > 1_000_000:
-        from vscode_gateway.errors import ErrorCode, GatewayError
-
+    if len(encoded) > 1_000_000:
         raise GatewayError(
             ErrorCode.SSH_CONFIG_INVALID, "Config exceeds size limit", status_code=400
         )
 
-    if expected_revision is not None and config_path.exists():
-        current_text = config_path.read_text(encoding="utf-8")
-        current_revision = compute_config_revision(current_text)
-        if expected_revision != current_revision:
-            from vscode_gateway.errors import ErrorCode, GatewayError
+    unsafe = find_unsafe_directives(text)
+    if unsafe:
+        raise GatewayError(
+            ErrorCode.SSH_CONFIG_INVALID,
+            f"Config contains prohibited directives: {sorted(set(unsafe))}",
+            status_code=400,
+        )
 
+    aliases = discover_aliases(text)
+    if not aliases:
+        # An empty candidate with zero aliases is allowed; ``ssh -G`` would
+        # otherwise reject nothing meaningful. Publish an empty catalog.
+        pass
+
+    # Serialize all writes through one process-wide lock so concurrent saves
+    # cannot race on the same target file or its revision.
+    async with _CONFIG_WRITE_LOCK:
+        if expected_revision is not None and config_path.exists():
+            current_text = config_path.read_text(encoding="utf-8")
+            current_revision = compute_config_revision(current_text)
+            if expected_revision != current_revision:
+                raise GatewayError(
+                    ErrorCode.CONFLICT,
+                    "Config was modified; refresh and retry",
+                    status_code=409,
+                )
+
+        # Reject line/alias-count limits before invoking external tools.
+        lines = text.splitlines()
+        if len(lines) > 10_000:
             raise GatewayError(
-                ErrorCode.CONFLICT,
-                "Config was modified; refresh and retry",
-                status_code=409,
+                ErrorCode.SSH_CONFIG_INVALID, "Config exceeds line limit", status_code=400
+            )
+        if len(aliases) > 1000:
+            raise GatewayError(
+                ErrorCode.SSH_CONFIG_INVALID, "Config exceeds alias count limit", status_code=400
             )
 
-    tmp_path = Path(str(config_path) + ".tmp")
-    tmp_path.write_text(text, encoding="utf-8")
-    os.chmod(tmp_path, 0o600)
+        # Create a unique temporary file in the target directory using exclusive
+        # creation so concurrent saves never share a path. Mode 0600.
+        parent = config_path.parent
+        try:
+            parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise GatewayError(
+                ErrorCode.CONFIG_EDIT_FAILED,
+                f"Cannot access config directory: {exc}",
+                status_code=500,
+            ) from exc
 
+        fd, tmp_name = tempfile.mkstemp(prefix=".cfg.", suffix=".tmp", dir=str(parent))
+        tmp_path = Path(tmp_name)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(encoded)
+                f.flush()
+                os.fsync(f.fileno())
+
+            # Validate every candidate alias using the candidate path, not the
+            # live file. Reject on the first failure.
+            for alias in aliases:
+                try:
+                    ok = await validate_alias(settings, alias, config_path=tmp_path)
+                except Exception as exc:
+                    raise GatewayError(
+                        ErrorCode.SSH_CONFIG_INVALID,
+                        f"Failed to validate alias '{alias}': {exc}",
+                        status_code=400,
+                    ) from exc
+                if not ok:
+                    raise GatewayError(
+                        ErrorCode.SSH_CONFIG_INVALID,
+                        f"Alias '{alias}' failed validation",
+                        status_code=400,
+                    )
+
+            os.replace(tmp_path, config_path)
+            tmp_path = None  # ownership transferred; do not clean up below
+
+            # fsync the parent directory so the rename is durable on disk.
+            dir_fd = os.open(str(parent), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except BaseException:
+            # Cleanup on any failure path (validation, OS error, cancellation).
+            if tmp_path is not None and tmp_path.exists():
+                with contextlib.suppress(OSError):
+                    tmp_path.unlink()
+            raise
+
+    # Re-publish the catalog from the committed file so the published snapshot
+    # does not describe candidate-only state. Operate outside the write lock
+    # to keep the lock critical section minimal.
+    try:
+        committed_text = config_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise GatewayError(
+            ErrorCode.CONFIG_EDIT_FAILED,
+            f"Failed to re-read committed config: {exc}",
+            status_code=500,
+        ) from exc
+
+    committed_aliases = discover_aliases(committed_text)
     catalog = CatalogSnapshot(
-        revision=compute_config_revision(text),
-        aliases=tuple(sorted(discover_aliases(text))),
+        revision=compute_config_revision(committed_text),
+        aliases=tuple(sorted(committed_aliases)),
         loaded_at=datetime.now(UTC),
     )
-
-    for alias in catalog.aliases:
-        try:
-            ok = await validate_alias(settings, alias)
-        except Exception:
-            continue
-        if not ok:
-            pass
-
-    with tmp_path.open("r+") as f:
-        os.fsync(f.fileno())
-    os.replace(tmp_path, config_path)
-    dir_fd = os.open(str(config_path.parent), os.O_RDONLY)
-    os.fsync(dir_fd)
-    os.close(dir_fd)
-
     return catalog

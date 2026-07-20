@@ -27,6 +27,7 @@ from vscode_gateway.db import get_session
 from vscode_gateway.errors import GatewayError
 from vscode_gateway.models import (
     CatalogResponse,
+    SessionState,
     SshConfigResponse,
     SshConfigUpdateRequest,
     VersionResponse,
@@ -426,19 +427,47 @@ def create_routes(
 
     @router.websocket("/editor/{session_id}/{rest_of_path:path}")
     async def proxy_ws_route(ws: WebSocket, session_id: str, rest_of_path: str):
+        # Per plan §16.3: authenticate before ``accept`` and before any
+        # upstream connection. We reject with a stable close code so no
+        # internals leak and no upstream contact occurs.
+        if not is_authenticated(ws):
+            await ws.close(code=4401)
+            return
+
+        # Exact browser Origin validation. Browsers always send ``Origin``
+        # on WebSocket handshakes; a missing Origin is treated as a
+        # non-browser client and rejected by default per the documented
+        # policy.
+        origin = ws.headers.get("origin")
+        if origin is None or origin != settings.canonical_origin:
+            await ws.close(code=4403)
+            return
+
         try:
             sid = proxy_adapter.parse_session_id(session_id)
         except GatewayError:
             await ws.close(code=4004)
             return
 
-        record = await get_session(ws.app.state.db, str(sid))
-        if record is None:
+        # Resolve through the in-memory registry first; reject missing /
+        # stale targets before contacting the database or upstream.
+        if proxy_registry.lookup(sid) is None:
             await ws.close(code=4004)
             return
 
-        session_service.on_client_connected(sid)
+        # Re-read the durable session and require READY. A stale URL for
+        # an old run must fail after reopen even if a registry entry
+        # somehow lingered.
+        record = await get_session(ws.app.state.db, str(sid))
+        if record is None or record.state != SessionState.READY:
+            await ws.close(code=4004)
+            return
 
+        # ``proxy_websocket`` increments presence exactly once after the
+        # upstream handshake + downstream accept succeed. The matching
+        # decrement is performed here, exactly once, regardless of which
+        # failure path occurred (presence is balanced because increment
+        # only happens after successful establishment).
         try:
             await proxy_adapter.proxy_websocket(sid, ws)
         finally:

@@ -1,7 +1,7 @@
 # AGENTS.md
 
 ## Repository status
-This is a planned greenfield Python rewrite of the OpenVSCode SSH Gateway. No code exists yet. The design document is `Python Rewrite Plan.md` — read it before writing any code.
+Python rewrite of the OpenVSCode SSH Gateway. Code lives under `src/vscode_gateway/`. The design document is `Plan.md` (previously `Python Rewrite Plan.md`) — read it before writing any code. A static review of the current implementation is in `review.md`; address its open Critical/High findings before broadening feature work.
 
 ## Tech stack
 - Python 3.13+ (uv + pyproject.toml for packaging)
@@ -25,9 +25,8 @@ This is a planned greenfield Python rewrite of the OpenVSCode SSH Gateway. No co
 - Disconnect grace period triggers auto-close
 
 ## Commands
-No commands are defined yet. Expected conventions (once code exists):
 - `uv run ruff check . && uv run ruff format --check .` for lint/format
-- `uv run pyright` or `uv run mypy --strict` for type checking
+- `uv run pyright` for type checking
 - `uv run pytest` for tests; use `-k` to target a single test
 
 ## Conventions from the design doc

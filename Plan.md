@@ -1,15 +1,18 @@
 # OpenVSCode SSH Gateway
 
-**Status:** Proposed greenfield rewrite  
-**Target:** A smaller, single-process Python service preserving the gateway's essential behavior  
+**Status:** Implementation audit — corrective hardening required before production  
+**Target:** A production-ready, single-process Python service that preserves the implemented architecture and closes the audited security, lifecycle, recovery, and test gaps  
 **Primary architectural decision:** The dashboard, control API, and proxied OpenVSCode editor share one authenticated origin and one application domain  
-**Compatibility policy:** Preserve user-visible capabilities and operational safety, not the current TypeScript module boundaries, private APIs, database schema, or dual-origin security model
+**Compatibility policy:** Preserve user-visible capabilities and operational safety, not the earlier TypeScript module boundaries, private APIs, database schema, or dual-origin security model
 
 ---
 
+> [!IMPORTANT]
+> **2026-07-20 implementation audit:** The Python architecture described below is already present in the repository, but the current implementation is not production-ready. The corrective requirements in this revision—especially authenticated WebSockets, safe Retry, candidate SSH-config validation, resource-owned capacity, cancellation-safe lifecycle handling, real readiness, and executable integration tests—take precedence over older illustrative pseudocode where they differ.
+
 ## 1. Executive summary
 
-Rewrite the repository as a compact Python application that:
+Complete and harden the existing compact Python application so that it:
 
 1. Discovers workspaces from positive, literal `Host` aliases in a dedicated OpenSSH configuration.
 2. Uses the system `ssh`, `scp`, and `ssh-keygen` executables so OpenSSH remains responsible for `HostName`, `User`, `IdentityFile`, `ProxyJump`, host-key checking, agents, and other SSH behavior.
@@ -22,7 +25,7 @@ Rewrite the repository as a compact Python application that:
 9. Keeps SSH configuration editing and SSH key management, but implements them through small, explicit services.
 10. Uses mature Python libraries for HTTP, WebSocket, settings, templates, password hashing, validation, and SQLite access instead of reproducing those facilities.
 
-The rewrite should intentionally remove:
+The implemented architecture intentionally removes:
 
 - Separate control and editor origins.
 - Editor grants and one-time handoff tokens.
@@ -36,37 +39,56 @@ The rewrite should intentionally remove:
 - A broad hexagonal architecture with an interface for every internal dependency.
 - Automatic retry orchestration beyond a few bounded, local retries around known transient operations.
 
-The resulting service should be understandable by reading roughly ten Python modules and one remote helper script.
+The service should remain understandable by reading roughly ten Python modules and one remote helper script. Corrective work must not reintroduce the orchestration layers intentionally removed by this architecture.
 
 ---
 
 ## 2. Source-system assessment
 
-The current repository already has several sound product decisions that should remain:
+The repository now implements the planned Python/FastAPI architecture rather than the earlier TypeScript source system. The current baseline includes:
 
-- A workspace is derived from a dedicated SSH config alias rather than a separately managed database record.
-- The alias is both the workspace identifier and its display name.
-- System OpenSSH resolves connection details.
-- OpenVSCode starts folderless.
-- One private editor run exists per open alias.
-- Remote OpenVSCode and SSH forwards bind only to loopback.
-- A browser-disconnect grace period delays cleanup.
-- Startup recovery inspects unfinished runs and attempts safe cleanup or restoration.
-- The OpenVSCode artifact is pinned and digest-verified.
-- Remote process cleanup uses strong process identity rather than killing a PID blindly.
+- one FastAPI application and one public origin;
+- a signed browser session and CSRF mechanism;
+- SSH alias discovery from a dedicated OpenSSH config;
+- SQLite session persistence;
+- a `SessionService` with per-alias locks and background lifecycle tasks;
+- system `ssh`, `scp`, and `ssh-keygen` subprocesses;
+- a remote helper and pinned OpenVSCode artifact workflow;
+- loopback-only OpenVSCode and SSH forwarding;
+- an HTTP/WebSocket editor proxy under `/editor/{session_id}/`;
+- dashboard, SSH-config, and key-management routes;
+- unit and integration test directories.
 
-The current implementation also carries complexity that was justified by its original security model but is not required for this rewrite:
+### 2.1 Audit result
 
-- The control plane and editor are dispatched by distinct origins.
-- Editor access uses grants, secrets, handoff routes, token persistence, and proxy rewriting.
-- The session model exposes many phases, desired state, runtime observations, tunnel observations, retry observations, and reconnect deadlines.
-- The orchestrator contains queues, mutexes, abort controllers, event subscriptions, retry policies, recovery branches, and transition logic.
-- The HTTP/WebSocket proxy implements significant authentication and transformation logic.
-- Operational persistence is split across several repositories and tables.
+The architecture is directionally conformant, but the implementation has production-blocking deviations:
 
-The Python rewrite accepts a different trust boundary: authenticated OpenVSCode content is trusted to share the dashboard's origin. This is explicitly requested and should be documented as a product assumption, not presented as equivalent security to the current dual-origin design.
+- the editor WebSocket route is not authenticated and does not validate exact Origin or `ready` state;
+- `SessionService.retry()` recursively acquires the same non-reentrant alias lock and can deadlock;
+- SSH config save validates the live file rather than the candidate file and does not reject failed validation;
+- capacity is an anonymous in-memory counter that leaks on some failures and is not rebuilt for recovered sessions;
+- startup cancellation and unexpected exceptions do not guarantee resource cleanup and durable error state;
+- close can act on a stale startup snapshot and miss a newly created remote process;
+- readiness is unconditional even when recovery fails;
+- cookie/session behavior is inconsistent with the middleware-only design, and generation/throttling are not fully enforced;
+- the HTTP proxy buffers request and response bodies rather than streaming;
+- subprocess output is truncated only after unbounded buffering;
+- artifact download/cache operations need size and concurrency bounds;
+- core integration tests are placeholders and do not prove the definition of done.
 
----
+### 2.2 Corrective design constraint
+
+Corrective work must preserve the existing simplification decisions:
+
+- keep one authenticated origin;
+- keep one ASGI process and enforce it with an operating-system singleton lock;
+- keep SQLite, system OpenSSH, one `SessionService`, and the small remote helper;
+- do not add Redis, a generic job queue, a second editor-authentication system, or distributed coordination;
+- solve lifecycle correctness through explicit resource ownership, idempotent cleanup, durable state transitions, and tests.
+
+### 2.3 Review scope
+
+The 2026-07-20 review was static because the repository could not be cloned or executed in the review environment. Before release, all findings must be verified from a pinned commit by running formatting, type checking, unit, integration, helper, browser, security, load, and restart tests.
 
 ## 3. Goals
 
@@ -100,7 +122,7 @@ The first production-ready Python release must provide:
 
 ### 3.2 Simplicity goals
 
-The rewrite should optimize for:
+The implementation should continue to optimize for:
 
 - One application process.
 - One public origin.
@@ -130,7 +152,7 @@ The rewrite should optimize for:
 
 ## 4. Non-goals
 
-The Python rewrite will not initially provide:
+The production baseline will not initially provide:
 
 - Multiple gateway users, organizations, teams, roles, or per-workspace ACLs.
 - Multi-instance active/active deployment.
@@ -373,15 +395,19 @@ Run one ASGI process with one worker:
 uvicorn vscode_gateway.app:create_app --factory --workers 1
 ```
 
-A single worker is an architectural constraint in the first release because:
+A single worker is an architectural constraint because alias locks, capacity ownership, tunnel handles, proxy targets, WebSocket counts, grace timers, and lifecycle tasks are process-local.
 
-- alias locks are in process;
-- capacity tracking is in process;
-- tunnel subprocess handles are in process;
-- WebSocket connection counts are in process;
-- grace timers are in process.
+Documentation and the Uvicorn command are not sufficient enforcement. At startup, before opening the mutable database or launching recovery, the application must:
 
-The service should fail startup when configured with a multi-worker mode. If future multi-process deployment is required, it should be a separate design using external coordination.
+1. create/open a lock file inside the private state directory;
+2. acquire an exclusive non-blocking operating-system file lock;
+3. hold the descriptor and lock for the complete process lifetime;
+4. fail startup with an actionable error when the lock is already held;
+5. release it only during final process teardown.
+
+This rejects both accidental multi-worker Uvicorn deployments and a second service instance sharing the same state directory. A test must start two application processes against one state directory and prove that exactly one reaches readiness.
+
+If future multi-process deployment is required, it is a separate design requiring external coordination for locks, capacity, tunnels, registry state, presence, and timers.
 
 ### 6.2 Reverse proxy and TLS
 
@@ -948,39 +974,29 @@ GET /api/ssh/config
 PUT /api/ssh/config
 ```
 
-`GET` response:
+`GET` returns current text and a SHA-256 revision. `PUT` supplies candidate text and `expectedRevision`.
 
-```json
-{
-  "text": "...",
-  "revision": "sha256:..."
-}
-```
-
-`PUT` request:
-
-```json
-{
-  "text": "...",
-  "expectedRevision": "sha256:..."
-}
-```
+All writes are serialized through one process-wide config-write lock. The lock covers the revision recheck, candidate validation, atomic replacement, committed-file refresh, catalog publication, and removed-alias reconciliation.
 
 Write algorithm:
 
-1. Require authenticated session and valid CSRF token.
-2. Reject when `expectedRevision` differs from current file hash.
-3. Enforce byte-size and line-length limits.
-4. Reject NUL bytes and invalid UTF-8.
-5. Write to a temporary file in the same directory with mode `0600`.
-6. Validate high-risk policy.
-7. Discover candidates from the temporary file.
-8. Run `ssh -F <temp> -G <alias>` for each candidate.
-9. `fsync` the temporary file.
-10. Atomically replace the target with `os.replace`.
-11. `fsync` the parent directory.
-12. Publish the new catalog snapshot.
-13. Reconcile sessions for aliases that were removed.
+1. Require an authenticated session and valid CSRF token.
+2. Under the config-write lock, re-read the active file and reject when `expectedRevision` differs from its hash.
+3. Enforce body byte-size, line-count, line-length, alias-count, and validation-time limits.
+4. Reject NUL bytes, invalid UTF-8, unsafe file state, and prohibited directives.
+5. Create a unique temporary file in the same directory using exclusive creation and mode `0600`; do not reuse a deterministic `.tmp` path.
+6. Write the exact candidate bytes and flush them.
+7. Discover candidate aliases from the temporary file.
+8. For every candidate, run exactly `ssh -F <temporary-file> -G <alias>` through the bounded subprocess primitive.
+9. Reject the operation on any nonzero exit, timeout, oversized output, malformed result, or policy error. Delete the temporary file and leave the active file/catalog unchanged.
+10. `fsync` the temporary file.
+11. Atomically replace the target with `os.replace`.
+12. `fsync` the parent directory.
+13. Re-read the committed target, compute its revision, and rebuild a valid catalog snapshot from that committed path.
+14. Publish the snapshot only after committed-file validation succeeds.
+15. Reconcile removed aliases only from the newly published valid snapshot.
+
+If a post-replace refresh unexpectedly fails, do not publish candidate-derived state. Report a degraded catalog and preserve the last-known-good snapshot while surfacing an operator error. Tests must prove that invalid content never replaces active bytes and that validation argv references the candidate path.
 
 ### 11.4 Unsafe-directive policy
 
@@ -1030,16 +1046,19 @@ async def run_process(
 
 Requirements:
 
-- uses `asyncio.create_subprocess_exec`;
-- never uses a shell;
-- starts a new local process group when cleanup requires it;
-- enforces timeout;
-- sends TERM then KILL on timeout;
-- bounds captured output;
-- decodes with replacement only for logs;
-- preserves raw bytes when parsing a protocol;
-- logs executable and redacted argument classes, not secrets;
-- returns exit code, stdout, stderr, duration, and timeout status.
+- use `asyncio.create_subprocess_exec` and never a shell;
+- start a new local process group when cleanup requires it;
+- enforce timeout and cancellation with TERM followed by KILL;
+- read stdout and stderr concurrently to avoid pipe deadlock;
+- enforce `max_stdout` and `max_stderr` while reading, not by slicing after `communicate()` has buffered everything;
+- terminate the process group and return a distinct oversized-output error when either bound is exceeded;
+- retain only a documented bounded diagnostic prefix/tail;
+- preserve raw bytes for protocols and decode with replacement only for sanitized logs;
+- log executable and redacted argument classes, not secrets;
+- return exit code, bounded stdout/stderr, duration, timeout status, and oversized-output status;
+- guarantee child reaping on timeout, cancellation, output overflow, and caller error.
+
+Tests must include a child that writes indefinitely to stdout and stderr and prove bounded memory behavior and deterministic termination.
 
 ### 12.2 Connectivity probe
 
@@ -1216,123 +1235,64 @@ If identity does not match, return `remote_identity_conflict`; do not kill the p
 
 ### 14.1 Open
 
-```python
-async def open(alias: str) -> SessionView:
-    async with alias_lock(alias):
-        catalog = catalog_service.snapshot()
+`POST /open` persists `starting`, schedules one named background operation by session ID, and returns `202`. The operation owns an explicit resource ledger containing the capacity reservation, row, remote identity, tunnel process, and registry entry acquired so far.
 
-        if not catalog.is_valid_alias(alias):
-            raise AliasNotFound(alias)
+Algorithm under the alias lock:
 
-        existing = await db.get_by_alias(alias)
-        if existing:
-            if existing.state in {STARTING, READY}:
-                return to_view(existing)
-            if existing.state == STOPPING:
-                raise Conflict("session is stopping")
-            if existing.state == ERROR:
-                raise Conflict("session is in error; retry or close it")
+1. Require a valid catalog alias.
+2. Return the existing view for `starting` or `ready`; reject `stopping` or `error` as specified.
+3. Generate the session ID.
+4. Reserve capacity for that specific session ID.
+5. Insert the `starting` row.
+6. If insertion or task scheduling fails, release that session's reservation and remove any inserted row before returning an error.
+7. Record the start task by session ID and release the alias lock.
 
-        capacity.acquire_nowait_or_raise()
+Background startup:
 
-        session = new_starting_session(alias)
-        await db.insert(session)
+1. Progress through validate, install, remote start, tunnel start, and health verification.
+2. Persist remote identity immediately after creation and tunnel identity immediately after creation.
+3. Do not add the proxy registry target until health verification succeeds and the durable state is ready, or make route resolution require both registry and DB `ready` atomically.
+4. On `GatewayError`, clean every resource in the ledger, mark a sanitized durable error when the row remains, and release capacity only if resources are proven absent and the row is deleted/non-resource-bearing by policy.
+5. On unexpected `Exception`, perform the same cleanup and write `internal_error`; do not merely log and leave `starting`.
+6. On `asyncio.CancelledError`, run cancellation-safe cleanup, preserve evidence when safety cannot be established, then re-raise.
+7. Remove the task from the task registry exactly once in `finally`.
 
-        try:
-            await update_stage(session, VALIDATE)
-            capabilities = await runtime.capabilities(alias)
-
-            await update_stage(session, INSTALL)
-            await runtime.ensure_installed(alias, capabilities.platform)
-
-            await update_stage(session, START_REMOTE)
-            remote = await runtime.start_session(alias, session.id)
-            await db.set_remote_identity(session.id, remote)
-
-            await update_stage(session, START_TUNNEL)
-            tunnel = await ssh.start_local_forward(
-                alias=alias,
-                remote_port=remote.port,
-            )
-            await db.set_tunnel_identity(session.id, tunnel)
-            registry.add(session.id, tunnel.local_port)
-            start_tunnel_watcher(session.id, tunnel.process)
-
-            await update_stage(session, VERIFY)
-            await verify_editor_health(session.id, tunnel.local_port)
-
-            ready = await db.mark_ready(session.id)
-            return to_view(ready)
-
-        except CancelledError:
-            await best_effort_cleanup(session.id)
-            raise
-        except GatewayError as exc:
-            await best_effort_cleanup_partial_resources(session.id)
-            await db.mark_error(session.id, exc.code, exc.safe_message)
-            raise
-        finally:
-            if final state is not active:
-                capacity.release()
-```
-
-Implementation detail: the HTTP request should not necessarily remain open for the entire remote startup. Two acceptable API styles exist:
-
-- `POST /open` performs startup and returns when `ready` or `error`; simplest server logic, but browser request may be long.
-- `POST /open` persists `starting`, schedules the operation in the lifespan task group, and returns `202`; dashboard polls status.
-
-Choose the second style for production. It keeps request deadlines independent from SSH startup while still avoiding a generic job queue. The operation is just one named task stored by session ID.
+Critical cleanup/identity commits may be minimally shielded from cancellation. Network waits and long operations must remain cancellable. Tests must inject failures and cancellation after each acquisition point.
 
 ### 14.2 Close
 
-```python
-async def close(alias: str, reason: CloseReason) -> None:
-    async with alias_lock(alias):
-        session = await db.get_by_alias(alias)
-        if session is None:
-            return
+Close is idempotent and runs as a named background operation. It must not make cleanup decisions from a stale record captured before startup cancellation.
 
-        await db.mark_stopping(session.id, reason)
-        cancel_start_task_if_present(session.id)
-        cancel_grace_timer(session.id)
-        registry.remove(session.id)
+Algorithm:
 
-        errors = []
+1. Under the alias lock, re-read the current row; return if absent.
+2. Mark `stopping`, cancel the grace timer, and remove the proxy registry target.
+3. Cancel and await the start task. The start task must complete its cancellation cleanup contract.
+4. Re-read the row and merge its current persisted identities with the operation resource ledger.
+5. Terminate an owned tunnel handle; otherwise terminate a persisted local PID only after ownership validation.
+6. Inspect/stop the remote managed session by session ID whenever it may have been created, including partial `starting` operations. Do not skip remote inspection solely because an earlier snapshot had no PID.
+7. If any resource cannot be proven absent, retain the row as `error/stop_failed` with a safe message and keep capacity owned.
+8. Remove the remote managed directory only after process absence is established.
+9. Delete the row and release capacity for that session ID exactly once.
 
-        tunnel = get_tunnel_handle(session.id)
-        if tunnel:
-            errors += await terminate_tunnel(tunnel)
-        elif session.tunnel_pid:
-            errors += await terminate_owned_local_process(session.tunnel_pid)
-
-        if session.remote_pid or session.state != STARTING:
-            errors += await runtime.stop_session(alias, session.id)
-
-        if errors:
-            await db.mark_error(
-                session.id,
-                code="stop_failed",
-                message=safe_summary(errors),
-                stage="stop",
-            )
-            return
-
-        await runtime.remove_session(alias, session.id)
-        await db.delete(session.id)
-        capacity.release_if_held(session.id)
-```
-
-Close should be scheduled as a background operation and return `202` unless there is nothing to close.
+The route should return `202` for scheduled cleanup and `204` only when no row/resource exists. Shutdown waits for close tasks up to a configured deadline, then preserves durable evidence for anything unresolved.
 
 ### 14.3 Retry
 
-Retry is not a state transition within the same run.
+Retry creates a fresh run only after the errored run is safely closed. It must never call public `open()` while holding the same non-reentrant alias lock.
 
-1. Lock alias.
-2. Close/clean the errored session.
-3. If cleanup cannot establish safety, leave it in `error`.
-4. Delete the old row only after cleanup succeeds or resources are proven absent.
-5. Invoke Open to create a fresh session ID.
+Safe algorithm:
+
+1. Acquire the alias lock and require an `error` row.
+2. Cancel and await any residual start/grace task.
+3. Remove the registry entry.
+4. Inspect and synchronously clean tunnel, remote process, and managed directory using current persisted identity plus the resource ledger.
+5. If cleanup cannot prove absence, keep the old row in `error`, keep its capacity reservation, and return a retryable cleanup failure.
+6. Delete the old row and release that session ID's capacity reservation exactly once.
+7. Either call an internal `_open_locked(alias)` before releasing the lock, or release the lock and call public `open(alias)`. Do not recursively acquire the same lock.
+8. The new run receives a new session ID and a new capacity reservation.
+
+Regression tests must place a timeout around Retry, force every cleanup failure, and assert that old cleanup never overlaps new startup.
 
 ### 14.4 Tunnel exit
 
@@ -1357,17 +1317,20 @@ After a successfully validated catalog refresh:
 
 ### 14.6 Capacity
 
-- `max_sessions` counts `starting`, `ready`, `stopping`, and resource-bearing `error` sessions.
-- A stop releases capacity only after resources are absent and the row is deleted.
-- Capacity is rebuilt from the database during startup recovery.
-- A global semaphore prevents concurrent starts beyond the limit.
-- The database uniqueness constraint prevents two sessions for one alias.
-
----
+- `max_sessions` counts every session that owns or may own resources: `starting`, `ready`, `stopping`, and resource-bearing `error`.
+- Capacity ownership is represented by a session-ID keyed set/ledger, not an anonymous counter.
+- Reserving an existing session ID and releasing an unowned session ID are idempotent and observable.
+- Open reserves only for its generated session ID and rolls back the reservation if row insertion or task scheduling fails.
+- Close/Retry release only after tunnel and remote resources are absent and the old row is deleted.
+- Recovery inspects all persisted rows, determines which rows are resource-bearing, and rebuilds the ownership ledger before mutations are accepted.
+- Recovered `ready`, `starting`, `stopping`, and unresolved resource-bearing `error` rows consume capacity.
+- The dashboard and readiness diagnostics report configured, owned, and available capacity.
+- The database uniqueness constraint prevents two rows for one alias; the alias lock prevents process-local lifecycle races.
+- Tests cover restart at full capacity, insertion failure, double close, failed stop, failed retry, recovered errors, and repeated open/close cycles without drift.
 
 ## 15. Startup recovery
 
-Readiness remains false until recovery completes or reaches a safe degraded result.
+Readiness remains false until migrations, catalog initialization, singleton acquisition, capacity reconstruction, and recovery complete or reach an explicitly safe degraded result. `/readyz` must never return an unconditional success value.
 
 ### 15.1 Recovery goals
 
@@ -1427,15 +1390,23 @@ If an alias has been removed from config, the gateway may be unable to reach it.
 
 ### 15.4 Recovery deadline
 
-Recovery has a global configured deadline. When exceeded:
+Recovery has a global configured deadline. While recovery runs:
 
-- cancel outstanding probes;
-- mark affected rows `error/recovery_failed`;
-- finish startup in a degraded-but-operable state;
-- set readiness true only if the application can safely serve dashboard actions;
-- include unresolved count in `/readyz`.
+- application readiness state is `recovering`;
+- `/readyz` returns HTTP 503 with phase and unresolved counts;
+- editor proxy resolution and lifecycle mutations are rejected unless explicitly proven safe;
+- capacity is reconstructed from persisted/resource-bearing rows before any Open is admitted.
 
----
+When the deadline is exceeded:
+
+1. cancel outstanding probes with cancellation-safe cleanup;
+2. mark affected rows `error/recovery_failed` without deleting evidence;
+3. determine whether each unresolved row can still own resources;
+4. keep capacity reserved for unresolved resource-bearing rows;
+5. enter `degraded` only when dashboard inspection and safe Close/Retry actions can be served without violating invariants;
+6. otherwise fail startup.
+
+`/readyz` returns HTTP 200 only for `ready`, or for a documented safe `degraded` policy accepted by deployment. Its body includes phase, recovered, cleaned, failed, unresolved, capacity-owned, and catalog status. Tests must prove that a thrown recovery exception cannot result in `ready: true`.
 
 ## 16. Same-origin editor proxy
 
@@ -1447,40 +1418,43 @@ Public base:
 /editor/{session_id}/
 ```
 
-For every HTTP or WebSocket request:
+For every HTTP or WebSocket request, before any upstream connection:
 
-1. Authenticate the gateway session cookie.
-2. Parse and validate `session_id`.
-3. Look up the session in an in-memory registry.
-4. Confirm database/session state is `ready`.
-5. Resolve upstream to `127.0.0.1:<local_port>`.
-6. Preserve the remaining path and query string.
-7. Proxy the request.
+1. authenticate the signed gateway session;
+2. for browser WebSockets, validate `Origin` exactly against the configured canonical origin; handle a missing Origin only through an explicit documented non-browser policy;
+3. parse and validate `session_id`;
+4. look up the target in the in-memory registry;
+5. re-read the durable session and require `SessionState.READY`;
+6. ensure the registry target belongs to the same current session ID;
+7. resolve upstream only to `127.0.0.1:<local_port>`;
+8. preserve the remaining path and query string;
+9. proxy the request.
 
-Do not route by alias. A stale URL for an old run must fail after reopen.
+Do not route by alias. Do not accept an existing database row as sufficient authorization/readiness. A stale URL for an old run must fail after reopen. Authentication, Origin, stale-session, and state failures must occur before presence is incremented or the upstream is contacted.
 
 ### 16.2 HTTP proxy
 
 Use one process-wide `httpx.AsyncClient` with:
 
-- environment proxy use disabled;
+- `trust_env=False` so environment proxy variables cannot redirect loopback traffic;
 - no automatic redirects;
 - explicit connect/read/write/pool timeouts;
 - connection pooling;
-- HTTP/1.1 upstream unless a verified need exists otherwise.
+- HTTP/1.1 upstream unless verified otherwise.
 
 Request handling:
 
-- stream request body to upstream;
+- pass `request.stream()` to an HTTPX streaming request rather than calling `request.body()`;
 - copy method, path, and query;
-- set upstream `Host` to loopback target or the value OpenVSCode expects;
-- set `X-Forwarded-Proto`, `X-Forwarded-Host`, and `X-Forwarded-Prefix`;
+- set the expected upstream `Host` and forwarding headers;
 - drop hop-by-hop headers;
-- remove the gateway authentication cookie from `Cookie`;
-- preserve OpenVSCode cookies if any exist;
-- stream response body back;
+- remove only the gateway authentication cookie while preserving unrelated OpenVSCode cookies;
+- use `client.send(request, stream=True)` or equivalent;
+- stream upstream bytes directly to `StreamingResponse`;
+- close the upstream response in a guaranteed background/finally hook;
+- preserve repeated response headers where required rather than collapsing everything into a dictionary;
 - filter hop-by-hop response headers;
-- do not buffer large assets.
+- do not buffer large assets, uploads, downloads, or extension packages.
 
 Drop at minimum:
 
@@ -1495,27 +1469,26 @@ Transfer-Encoding
 Upgrade
 ```
 
-Handle `Set-Cookie` conservatively. Because OpenVSCode runs at its configured base path and without a connection token, avoid rewriting cookies unless an integration test demonstrates a concrete need.
+Handle `Set-Cookie` conservatively and prove behavior with integration tests. Add large streamed upload/download tests that assert bounded gateway memory.
 
 ### 16.3 WebSocket proxy
 
 Flow:
 
-1. Authenticate downstream WebSocket before `accept`.
-2. Resolve ready session.
-3. Build upstream `ws://127.0.0.1:<port>/<path>?<query>`.
-4. Forward requested subprotocols.
-5. Connect with `websockets.connect`.
-6. Accept downstream with the selected subprotocol.
-7. Start two tasks in an `asyncio.TaskGroup`:
-   - downstream → upstream;
-   - upstream → downstream.
-8. Preserve text/binary frame type.
-9. Propagate normal close code and reason where valid.
-10. Cancel the peer relay when either direction exits.
-11. Decrement presence exactly once in `finally`.
+1. Authenticate the downstream signed session before `accept`.
+2. Validate exact browser Origin.
+3. Resolve the registry target and require the durable session to be `ready`.
+4. Build upstream `ws://127.0.0.1:<port>/<path>?<query>`.
+5. Forward requested subprotocols through a validated allow-through representation.
+6. Establish the upstream connection.
+7. Accept downstream with the selected subprotocol.
+8. Increment presence only after authorization and successful connection establishment.
+9. Start two tasks in an `asyncio.TaskGroup` for downstream→upstream and upstream→downstream.
+10. Preserve text/binary frame type and propagate valid close codes/reasons.
+11. Cancel the peer relay when either direction exits.
+12. Decrement presence exactly once in `finally`, including handshake and relay failures after increment.
 
-The `websockets` package owns protocol framing, ping/pong, close handling, compression negotiation, and flow control.
+The `websockets` package owns protocol framing, ping/pong, close handling, compression negotiation, flow control, and bounded queue configuration. Tests must prove that unauthenticated, wrong-Origin, stale, and non-ready sockets never contact the upstream.
 
 ### 16.4 Presence tracking
 
@@ -1572,82 +1545,61 @@ After recovery:
 
 ### 17.1 Password source
 
-Use one Argon2 password hash stored in a private file:
+Use one Argon2 password hash stored in a private file. Never store or log plaintext. Validate file ownership, regular-file type, absence of symlink traversal, and mode `0600` at startup.
 
-```text
-state/
-├── password.hash    mode 0600
-└── session.secret   mode 0600, at least 32 random bytes
-```
+### 17.2 One middleware-owned cookie session
 
-The gateway never stores a plaintext password.
+Use Starlette `SessionMiddleware` as the only code that serializes or sets the gateway session cookie. Application helpers modify `request.session`; they must not emit a second manual cookie with the same name.
 
-Provide an admin script:
+Required settings:
 
-```text
-python scripts/create-password-hash.py
-```
-
-### 17.2 Cookie session
-
-Use Starlette `SessionMiddleware` with:
-
-- `https_only=True` in production;
+- `https_only=True` in production and startup refusal when production origin is HTTPS but secure cookies are disabled;
 - `same_site="lax"`;
 - `path="/"`;
-- a short, configurable maximum age;
-- session payload containing only:
-  - authenticated flag;
-  - issued timestamp;
-  - session generation;
-  - CSRF secret.
+- `HttpOnly` through middleware behavior;
+- short configurable maximum age;
+- payload limited to authenticated flag, issued timestamp, session generation, and CSRF secret.
 
-The cookie is signed, not a place for confidential data.
+Store the signing secret as at least 32 random bytes using a deterministic lossless representation such as base64 or hex. Never decode arbitrary random bytes with replacement semantics. Validate mode `0600`, ownership, and minimum entropy on every startup.
 
-### 17.3 Session invalidation
+### 17.3 Session validation and invalidation
 
-A `session_generation` integer is loaded from configuration or a small state file. Rotating it invalidates all existing browser sessions.
+Every protected HTTP and WebSocket request validates:
 
-Logout clears the cookie.
+- authenticated flag;
+- issued-at timestamp and maximum age;
+- current `session_generation`;
+- any required version marker.
+
+Rotating the generation invalidates all existing sessions. Login creates a fresh CSRF secret. Logout is an authenticated, CSRF-protected mutation that clears the middleware session.
 
 ### 17.4 CSRF
 
-Every state-changing route requires:
+Every state-changing gateway route requires authenticated cookie plus a random per-login CSRF token in a form field or `X-CSRF-Token`. This includes logout, session lifecycle, config edits, and key mutations.
 
-- authenticated cookie; and
-- CSRF token in a form field or `X-CSRF-Token`.
-
-Use a random per-login token stored in the signed session and rendered into the dashboard.
-
-Because OpenVSCode shares the origin, trusted editor JavaScript can potentially access same-origin pages and obtain a CSRF token. CSRF still blocks cross-site requests, but it is not an isolation boundary against OpenVSCode or extensions. This limitation must be explicit.
+Because OpenVSCode shares the origin, trusted editor JavaScript can potentially access gateway routes. CSRF protects against cross-site requests, not malicious same-origin editor code or extensions. Preserve this explicit product trust assumption.
 
 ### 17.5 Login throttling
 
-Use a small in-memory limiter keyed by normalized client IP:
+Use a bounded in-memory limiter keyed by normalized client IP with a small burst, increasing delay after failures, expiry, bounded memory, and reset on success. Apply it in the actual login route and test activation, expiry, proxy-IP handling, and bounded-map eviction. Do not add Redis.
 
-- limited burst;
-- exponential delay after failures;
-- reset on success;
-- bounded map with expiry.
+### 17.6 HTTP and WebSocket hardening
 
-A library such as `limits` may be used, but a minimal fixed-window implementation is acceptable if it remains isolated and fully tested. Do not add Redis for a single-process service.
-
-### 17.6 HTTP hardening
-
-Add:
+Add and test:
 
 - `TrustedHostMiddleware`;
-- HTTPS redirect when deployed without an upstream redirect;
-- Content Security Policy for dashboard pages;
+- controlled forwarded-header trust;
+- HTTPS redirect when not handled upstream;
+- dashboard CSP;
 - `X-Content-Type-Options: nosniff`;
 - `Referrer-Policy: no-referrer`;
-- `Permissions-Policy`;
-- no caching for authenticated HTML/API responses;
-- strict input and body-size limits.
+- a restrictive `Permissions-Policy`;
+- `Cache-Control: no-store` for authenticated HTML/API responses;
+- strict body, field, alias, path, and upload limits;
+- exact WebSocket Origin validation before upstream connection;
+- client-safe error messages separated from detailed structured logs.
 
-Do not inject a dashboard CSP into proxied OpenVSCode responses. OpenVSCode requires its own script/style policy.
-
----
+Do not inject dashboard CSP into proxied OpenVSCode responses. Do not return raw SSH/helper stderr, remote paths, command strings, or internal exception text to clients.
 
 ## 18. Dashboard design
 
@@ -2039,15 +1991,23 @@ This is hardening, not part of the initial functional rewrite.
 #### Auth
 
 - correct password succeeds;
+- middleware is the only writer of the gateway cookie;
+- signing-secret encoding is lossless and minimum entropy is enforced;
+- issued-at and session generation are validated on HTTP and WebSocket requests;
 - incorrect password fails;
 - hash is never exposed;
 - session cookie flags are correct;
 - CSRF required for mutations;
-- login throttle activates and expires.
+- login throttle activates and expires;
+- logout requires authentication and CSRF;
+- exact WebSocket Origin validation rejects cross-site connections before upstream contact.
 
 #### Catalog
 
 - extracts literal aliases;
+- config candidate validation uses `ssh -F <candidate> -G`, never the live path;
+- invalid candidate leaves active bytes and last-good snapshot unchanged;
+- config writes are serialized and concurrent revision conflicts are deterministic;
 - excludes wildcards and negated patterns;
 - supports multiple aliases on one `Host` line;
 - ignores comments and whitespace;
@@ -2067,13 +2027,20 @@ This is hardening, not part of the initial functional rewrite.
 #### Session service
 
 - Open is idempotent in `starting` and `ready`;
+- row insertion or task scheduling failure rolls back capacity ownership;
+- cancellation after each resource acquisition cleans or retains visible evidence;
+- unexpected exceptions cannot leave an unowned durable `starting` row;
 - Close is idempotent when absent;
 - Open rejects missing alias;
-- capacity is enforced;
+- capacity is enforced and keyed by session ID;
+- capacity is rebuilt exactly from recovered resource-bearing rows;
+- double close/retry cannot double-release capacity;
 - one alias lock serializes races;
 - start failure performs cleanup;
 - tunnel loss marks error;
-- Retry creates a new session ID;
+- Retry completes without lock recursion/deadlock and creates a new session ID;
+- Retry does not overlap old cleanup with new startup;
+- failed Retry cleanup retains the old row and capacity ownership;
 - removed alias schedules Close;
 - stale catalog does not close sessions;
 - stop failure retains error record;
@@ -2097,7 +2064,7 @@ Simulate:
 - SSH success and JSON helper response;
 - SSH timeout;
 - nonzero exit;
-- oversized stderr;
+- oversized stdout and stderr terminate the child while capture remains bounded;
 - malformed JSON;
 - remote capability mismatch;
 - runtime missing then installed;
@@ -2113,6 +2080,8 @@ Run a local fake upstream ASGI/WebSocket server.
 
 Verify:
 
+- unauthenticated and wrong-Origin WebSockets fail before upstream connection;
+- non-ready and stale session IDs fail before upstream connection;
 - streamed request body;
 - streamed response body;
 - status and headers;
@@ -2171,12 +2140,12 @@ Scenarios:
 8. Close from dashboard.
 9. Reopen and confirm new session URL.
 10. Disconnect all editor tabs and verify grace cleanup.
-11. Restart gateway while ready and verify recovery.
+11. Restart gateway while ready and verify recovery, capacity reconstruction, and `/readyz` gating.
 12. Kill tunnel and verify visible error.
 13. Remove alias and verify cleanup.
-14. Save invalid config and verify original file remains.
+14. Save invalid config and verify the validator uses the candidate path and original bytes remain.
 15. Generate key and verify public key listing.
-16. Attempt unauthenticated editor HTTP and WebSocket access.
+16. Attempt unauthenticated and wrong-Origin editor HTTP and WebSocket access and assert the upstream receives no connection.
 17. Attempt CSRF mutation.
 18. Confirm remote OpenVSCode is not reachable except through SSH forwarding.
 
@@ -2200,211 +2169,74 @@ The gateway is single-user but should be tested for:
 
 ## 25. Implementation sequence
 
-The sequence is dependency-ordered. Each phase must leave tested, reviewable code.
+The architecture is implemented; the remaining sequence is corrective and release-gated. Every phase begins with a failing regression test and ends with executable evidence.
 
-### Phase 0: Validate the simplifying assumptions
+### Phase 0: Pin and reproduce
 
-Build throwaway spikes, not production abstractions.
+- Pin the reviewed commit in a remediation branch.
+- Run `uv sync`, Ruff, strict Pyright, pytest, Bandit, dependency audit, and existing browser tests.
+- Record all failures and remove placeholder/pass-only core tests.
+- Build deterministic fake SSH/helper/upstream fixtures.
 
-Tasks:
+**Exit:** clean, reproducible local/CI baseline with no silently skipped core suite.
 
-- Start the pinned OpenVSCode version with:
-  - loopback host;
-  - dynamic port;
-  - `--without-connection-token`;
-  - configured server base path;
-  - folderless mode.
-- Proxy its HTTP and WebSocket traffic under `/editor/<id>/`.
-- Confirm service worker, static assets, redirects, downloads, terminal WebSockets, and extension-host WebSockets behave behind the path prefix.
-- Confirm the same signed gateway cookie can guard both HTTP and WebSocket proxy routes.
-- Confirm system OpenSSH invocation works with:
-  - `IdentityFile`;
-  - SSH agent;
-  - nonstandard port;
-  - `ProxyJump`;
-  - strict host-key checking.
-- Decide the exact supported OpenVSCode version.
+### Phase 1: P0 security and corruption fixes
 
-Exit criteria:
+- Authenticate editor WebSockets, validate exact Origin, require registry plus DB `ready`.
+- Redesign Retry without recursive alias-lock acquisition.
+- Fix candidate SSH-config validation, serialization, and atomic publication.
+- Replace anonymous capacity counter with session-ID ownership and recovery reconstruction.
 
-- An automated spike test loads a usable editor through the planned single origin.
-- No OpenVSCode connection token is needed.
-- The exact base-path flag is confirmed for the pinned release.
-- Known required header or cookie rewrites are documented.
-- A direct host and a jump host both work with system OpenSSH.
+**Exit:** dedicated regression tests for all four issues pass repeatedly under concurrency and timeout.
 
-Do not proceed with the single-origin design if the base-path and WebSocket behavior cannot be made reliable without recreating the current complex proxy.
+### Phase 2: Cancellation-safe lifecycle and recovery
 
-### Phase 1: Application skeleton and operational foundations
+- Add startup resource ledger and generic/cancellation cleanup paths.
+- Cancel and await start tasks before Close cleanup; re-read current identity.
+- Make stop/retry preserve rows and capacity whenever absence is not proven.
+- Implement readiness phases, recovery deadline behavior, unresolved counts, and mutation gating.
+- Add an OS-level singleton state-directory lock.
 
-Tasks:
+**Exit:** failure injection after every acquisition point and restart-at-capacity tests show no lost resources, dead rows, or accounting drift.
 
-- Create `pyproject.toml`, Ruff, type checker, pytest, and CI.
-- Implement settings and startup validation.
-- Implement structured logging and request IDs.
-- Implement state-directory creation and permission checks.
-- Implement SQLite open, migration, and session CRUD.
-- Implement health/readiness.
-- Add systemd and reverse-proxy examples.
+### Phase 3: Authentication and browser hardening
 
-Exit criteria:
+- Make SessionMiddleware the sole cookie writer.
+- Use lossless signing-secret storage and enforce secure production cookie settings.
+- Enforce issued-at, session generation, login throttling, logout auth/CSRF, and security headers.
+- Separate safe client errors from internal diagnostics.
 
-- Empty application starts and stops cleanly.
-- Invalid secrets, paths, modes, or settings fail startup.
-- Migration tests pass.
-- `/healthz` and `/readyz` behave correctly.
+**Exit:** HTTP and WebSocket auth matrix, cookie, CSRF, throttle, generation-rotation, and header tests pass.
 
-### Phase 2: Authentication and dashboard shell
+### Phase 4: Proxy and subprocess resource bounds
 
-Tasks:
+- Implement true HTTP request/response streaming with `trust_env=False`.
+- Preserve required repeated headers and cookie semantics.
+- Bound WebSocket queues and presence accounting.
+- Bound stdout/stderr while reading and terminate oversized children.
+- Add artifact per-digest locking, size caps, unique temp files, streaming verification, and atomic cache publication.
 
-- Password hash script.
-- Login/logout and signed session cookie.
-- CSRF.
-- Login throttle.
-- Jinja base, login, and dashboard templates.
-- Static CSS and polling client.
-- Protected API dependency for HTTP and WebSocket.
+**Exit:** large transfer, slow client, disconnect, oversized output, and concurrent artifact tests remain within defined memory/process limits.
 
-Exit criteria:
+### Phase 5: Filesystem, construction, and diagnostics hardening
 
-- Unauthenticated dashboard/editor routes are rejected.
-- Cookie and CSRF tests pass.
-- Dashboard can render mocked workspace data.
-- No frontend build step exists.
+- Enforce private directories/files, ownership, regular-file, and symlink policy.
+- Register routes/static mounts once during app construction.
+- Add structured request/session IDs, redaction, readiness details, and capacity diagnostics.
 
-### Phase 3: SSH catalog, config, and key management
+**Exit:** startup rejects insecure state and repeated lifespan tests do not duplicate routes.
 
-Tasks:
+### Phase 6: Full integration and browser proof
 
-- Subprocess primitive.
-- Literal alias scanner.
-- OpenSSH `-G` validation.
-- Cached catalog snapshots.
-- Atomic config editor with revision check.
-- Unsafe directive policy.
-- Public-key listing.
-- Ed25519 key generation through `ssh-keygen`.
-- Config and key pages.
+- Complete subprocess, proxy, helper, lifecycle, recovery, and reverse-proxy integration suites.
+- Run Playwright flows for login, direct/ProxyJump open, terminal WebSocket, refresh, close, reopen, grace cleanup, config rejection, key management, and restart recovery.
+- Run repeated race, load, soak, disk-full, DB-busy, SSH-outage, and shutdown tests.
 
-Exit criteria:
+**Exit:** §30 Definition of done and §34 release gates are satisfied from a clean checkout.
 
-- Alias discovery matches fixtures.
-- `ProxyJump` fixture validates.
-- Concurrent config edits produce a revision conflict.
-- Invalid config never replaces the active file.
-- Generated private key remains server-side with correct mode.
+## 26. Implemented simplification map
 
-### Phase 4: Runtime artifact and helper
-
-Tasks:
-
-- OpenVSCode manifest model.
-- HTTPX streaming downloader.
-- Local digest cache.
-- Small remote helper.
-- Helper install/capability/inspect/start/stop protocol.
-- `scp` transfer adapter.
-- Remote helper security tests.
-
-Exit criteria:
-
-- Pinned artifact is verified locally and remotely.
-- Runtime install is idempotent.
-- OpenVSCode starts loopback-only and folderless.
-- Helper refuses malformed operations and unsafe archives.
-- PID reuse/identity conflict test proves no wrong process is killed.
-
-### Phase 5: Session lifecycle
-
-Tasks:
-
-- Session service.
-- Per-alias locks.
-- Capacity semaphore.
-- Start and Close tasks.
-- Tunnel process and watcher.
-- Health verification.
-- Error mapping.
-- Workspace projection.
-- Session API.
-
-Exit criteria:
-
-- Open reaches ready.
-- Close removes all resources.
-- Concurrent Open calls create one run.
-- Capacity works under races.
-- Every start-stage failure has a tested cleanup result.
-- Removed aliases close only after a valid catalog refresh.
-
-### Phase 6: HTTP and WebSocket proxy
-
-Tasks:
-
-- In-memory ready-session registry.
-- HTTP streaming adapter with HTTPX.
-- WebSocket relay with `websockets`.
-- Header/cookie filtering.
-- Stale session URL handling.
-- Presence count callbacks.
-
-Exit criteria:
-
-- OpenVSCode loads through the gateway.
-- Terminal/editor WebSockets work.
-- Unauthenticated proxy access fails before upstream connection.
-- Gateway cookie is never forwarded upstream.
-- Old session URL fails after reopen.
-
-### Phase 7: Grace period and recovery
-
-Tasks:
-
-- Presence tracking.
-- Disconnect deadline persistence.
-- Grace tasks.
-- Startup row recovery.
-- Tunnel recreation.
-- Remote orphan scan.
-- Recovery report and readiness integration.
-- Shutdown behavior.
-
-Exit criteria:
-
-- Final disconnect closes after grace.
-- Reconnect cancels close.
-- Restart during grace restores deadline.
-- Restart while ready restores tunnel/editor or surfaces error.
-- Orphan managed remote sessions are cleaned.
-- Conflicting process identity remains untouched and visible.
-
-### Phase 8: Hardening and cutover
-
-Tasks:
-
-- Full e2e suite.
-- Security headers.
-- Reverse-proxy deployment tests.
-- File-mode audit.
-- Log redaction audit.
-- Failure/soak testing.
-- Operator documentation.
-- TypeScript shutdown/cutover script.
-- Rollback procedure.
-
-Exit criteria:
-
-- Definition of done is satisfied.
-- A clean cutover and rollback have been rehearsed.
-- No old live session exists at database switch.
-- Python gateway operates from the same SSH config and keys without modifying them unexpectedly.
-
----
-
-## 26. TypeScript-to-Python simplification map
-
-| Current area | Python rewrite |
+| Earlier source-system area | Implemented Python direction |
 |---|---|
 | `auth/*` plus editor authentication | One `auth.py`, one signed session |
 | Separate control/editor origin dispatch | One FastAPI app and one origin |
@@ -2432,55 +2264,38 @@ Exit criteria:
 
 ## 27. Cutover plan
 
-### 27.1 Preserve
+The current repository already contains the Python implementation. Release is therefore a hardening cutover from a non-production baseline, not a TypeScript data migration.
 
-- Dedicated SSH config.
-- SSH key files.
-- Known-hosts behavior and OpenSSH environment.
-- OpenVSCode artifact version/digest after verification.
-- Public origin, if the deployment is moving from one origin to the new unified origin.
-- Operator-configured capacity and grace settings where semantics remain equivalent.
+### 27.1 Pre-release
 
-### 27.2 Do not migrate
+1. Pin an audited commit and complete Phases 0–6.
+2. Back up the SSH config, keys, artifact cache, state directory, and SQLite database.
+3. Ensure no placeholder core tests remain.
+4. Run the full test/security matrix from a clean checkout.
+5. Rehearse startup with an empty database and with representative persisted rows in every state.
+6. Rehearse a second-process startup and confirm it fails.
+7. Verify invalid SSH config cannot modify active bytes.
+8. Verify unauthenticated/wrong-Origin WebSockets never contact an upstream.
 
-- Existing SQLite operational database.
-- Editor grants.
-- Editor secrets.
-- Encrypted token records.
-- Local port leases.
-- Retry state.
-- Historical private session IDs.
+### 27.2 Production rollout
 
-### 27.3 Cutover procedure
+1. Drain and explicitly close existing test/non-production sessions.
+2. Verify the remote helper reports no unexpected managed runs.
+3. Deploy the pinned build behind the supported TLS reverse proxy.
+4. Keep readiness traffic disabled until `/readyz` reports a safe state.
+5. Smoke-test login, catalog, one direct or jump-host Open, editor HTTP, editor WebSocket, Close, and reopen.
+6. Confirm structured logs contain no secrets or raw remote diagnostics.
+7. Observe capacity-owned, recovered, unresolved, and tunnel metrics through one restart.
 
-1. Deploy Python gateway alongside TypeScript gateway on a private test port.
-2. Point it at a copy of SSH config and keys.
-3. Run catalog and connection smoke tests.
-4. Complete all end-to-end scenarios.
-5. Put TypeScript gateway into maintenance mode.
-6. Explicitly close all active sessions.
-7. Verify remote helper reports no live managed sessions.
-8. Stop TypeScript gateway.
-9. Back up its state database.
-10. Configure Python gateway with the production SSH config and key directories.
-11. Create a fresh Python SQLite database.
-12. Switch reverse proxy to the Python service.
-13. Verify login, alias listing, one Open, editor WebSocket, and Close.
-14. Keep the old binary and database read-only for rollback.
+### 27.3 Rollback
 
-### 27.4 Rollback
+1. Stop accepting mutations and drain editor traffic.
+2. Close all managed sessions and verify remote absence.
+3. Stop the new process.
+4. Restore the backed-up build/state only when its operational database and remote managed sessions are mutually consistent.
+5. Never roll back while leaving newer managed sessions untracked.
 
-1. Stop accepting Python mutations.
-2. Close Python-managed sessions.
-3. Confirm no Python-managed remote sessions remain.
-4. Stop Python gateway.
-5. Restore reverse-proxy routing to TypeScript.
-6. Start TypeScript gateway with its prior database.
-7. Do not attempt to import Python sessions into TypeScript.
-
-Because the two implementations use distinct operational databases, rollback depends on cleanly closing sessions rather than data translation.
-
----
+Rollback safety depends on verified resource cleanup, not only replacing application files.
 
 ## 28. Risks and mitigations
 
@@ -2560,7 +2375,7 @@ Review is required when:
 
 ## 30. Definition of done
 
-The rewrite is complete when all of the following are true:
+The implementation is release-ready when all of the following are true:
 
 ### Product
 
@@ -2569,17 +2384,19 @@ The rewrite is complete when all of the following are true:
 - Reopen creates a fresh private session URL.
 - OpenVSCode starts folderless and can open remote folders from the editor.
 - Direct and `ProxyJump` hosts work.
-- Config editing and key generation work.
+- Config editing validates the candidate path, preserves active bytes on failure, and key generation works.
 - Disconnect grace cleanup works.
-- Startup recovery works.
+- Startup recovery works and reconstructs capacity before readiness.
 
 ### Security
 
-- Dashboard and editor require authentication.
+- Dashboard and editor HTTP and WebSocket routes require authentication.
+- Browser WebSockets require exact canonical-Origin validation before upstream connection.
+- Proxy routing requires both registry ownership and durable `ready` state.
 - Mutation routes require CSRF.
 - Gateway cookie is not forwarded to OpenVSCode.
 - OpenVSCode and tunnels bind to loopback.
-- No subprocess invocation uses a shell.
+- No subprocess invocation uses a shell, and stdout/stderr limits are enforced while reading.
 - No dynamic remote operation is arbitrary.
 - Artifact digest is verified locally and remotely.
 - Unsafe archive extraction is rejected.
@@ -2595,13 +2412,16 @@ The rewrite is complete when all of the following are true:
 - Restart recovery handles each persisted state.
 - Removed aliases are reconciled safely.
 - Disk, timeout, malformed-output, and SSH-outage tests pass.
-- Graceful shutdown does not abandon untracked local tunnel processes.
+- Graceful shutdown and cancellation do not abandon untracked local tunnels or remote managed processes.
+- Retry cannot deadlock, overlap old cleanup with new startup, or double-release capacity.
+- `/readyz` is 503 until recovery is safe and reports unresolved/capacity details.
 
 ### Maintainability
 
 - Strict type checking passes.
 - Ruff passes.
-- Unit, integration, helper, and e2e suites pass.
+- Unit, integration, helper, and e2e suites pass with no placeholder/pass-only core tests.
+- Every Critical and High item from the 2026-07-20 audit has a regression test and is closed.
 - Production code remains within the agreed complexity budget or exceptions are documented.
 - No TypeScript runtime dependency or frontend build step remains.
 - Operator and development documentation is current.
@@ -2610,7 +2430,7 @@ The rewrite is complete when all of the following are true:
 
 ## 31. Recommended `pyproject.toml` dependency groups
 
-Illustrative dependency set; pin exact versions in the lockfile after the Phase 0 spike:
+Illustrative dependency set; pin exact versions in the lockfile and audit them for each release candidate:
 
 ```toml
 [project]
@@ -2647,87 +2467,71 @@ Keep `tenacity` only if retries remain localized and materially clearer than a s
 
 ---
 
-## 32. Initial implementation backlog
+## 32. Corrective implementation backlog
 
-### Foundation
+The base implementation exists. This backlog tracks only corrective work identified by the implementation audit.
 
-- [ ] Create Python package and CI.
-- [ ] Add settings validation.
-- [ ] Add structured logging and request ID middleware.
-- [ ] Add private directory/file-mode checks.
-- [ ] Add SQLite migration runner and schema.
-- [ ] Add health/readiness.
+### P0 — Blockers
 
-### Browser control plane
+- [ ] Authenticate editor WebSockets before upstream connection or downstream accept.
+- [ ] Validate exact canonical Origin for browser WebSockets.
+- [ ] Require registry ownership plus durable `ready` state for all proxy routes.
+- [ ] Redesign Retry to remove recursive alias-lock acquisition.
+- [ ] Await old-run cleanup before creating a replacement session.
+- [ ] Validate SSH config with `ssh -F <candidate> -G <alias>` and reject failures.
+- [ ] Serialize config writes and publish only committed valid snapshots.
+- [ ] Replace anonymous capacity count with a session-ID ownership ledger.
+- [ ] Rebuild capacity from resource-bearing rows before readiness.
+- [ ] Add regression tests for every P0 item.
 
-- [ ] Add password hash administration script.
-- [ ] Add login/logout.
-- [ ] Add signed sessions and CSRF.
-- [ ] Add dashboard template and polling.
-- [ ] Add problem response format.
+### P1 — Lifecycle and recovery
 
-### SSH
+- [ ] Add an Open resource ledger covering row, capacity, remote, tunnel, and registry ownership.
+- [ ] Clean up and mark durable error on generic exceptions and cancellation.
+- [ ] Cancel and await start tasks before Close cleanup.
+- [ ] Re-read current identity after cancellation; do not rely on stale records.
+- [ ] Retain rows/capacity when cleanup cannot prove absence.
+- [ ] Add readiness phases and HTTP 503 gating during recovery.
+- [ ] Report recovery and capacity details in `/readyz`.
+- [ ] Add an OS-level singleton lock for the state directory.
+- [ ] Add restart, cancellation, and failure-injection tests.
 
-- [ ] Add subprocess primitive.
-- [ ] Add alias scanner.
-- [ ] Add `ssh -G` validation.
-- [ ] Add catalog cache and revision.
-- [ ] Add atomic config save.
-- [ ] Add prohibited-directive policy.
-- [ ] Add key list/generate/delete.
+### P1 — Auth, proxy, and resource bounds
 
-### Runtime
+- [ ] Make SessionMiddleware the sole gateway-cookie writer.
+- [ ] Use lossless signing-secret storage and validate entropy/mode.
+- [ ] Enforce secure production cookies, issued-at, and session generation.
+- [ ] Apply login throttling and authenticated-CSRF logout.
+- [ ] Add security/no-store headers and safe client error mapping.
+- [ ] Stream HTTP proxy requests and responses; set `trust_env=False`.
+- [ ] Preserve required multi-value headers and non-gateway cookies.
+- [ ] Bound subprocess stdout/stderr while reading.
+- [ ] Add artifact size caps, per-digest locks, unique temp files, and streaming verification.
 
-- [ ] Add artifact manifest and cache.
-- [ ] Add streaming download and SHA-256.
-- [ ] Write reduced remote helper.
-- [ ] Add helper installation.
-- [ ] Add capability/runtime/session operations.
-- [ ] Add helper security tests.
+### P2 — Hardening and release proof
 
-### Sessions
-
-- [ ] Add per-alias locks.
-- [ ] Add capacity accounting.
-- [ ] Add Open task.
-- [ ] Add local tunnel.
-- [ ] Add health verification.
-- [ ] Add Close task.
-- [ ] Add Retry.
-- [ ] Add catalog reconciliation.
-- [ ] Add tunnel-exit handling.
-
-### Proxy and presence
-
-- [ ] Add ready-session registry.
-- [ ] Add HTTP stream proxy.
-- [ ] Add WebSocket relay.
-- [ ] Add cookie/header filters.
-- [ ] Add presence count.
-- [ ] Add grace timers.
-- [ ] Add stale URL tests.
-
-### Recovery and release
-
-- [ ] Add startup row recovery.
-- [ ] Add tunnel recreation.
-- [ ] Add remote orphan cleanup.
-- [ ] Add shutdown policy.
-- [ ] Add full Docker/Playwright e2e.
-- [ ] Add deployment docs.
-- [ ] Rehearse cutover and rollback.
-
----
+- [ ] Enforce private file ownership, modes, regular-file type, and symlink policy.
+- [ ] Move route/static registration out of lifespan.
+- [ ] Complete unit, subprocess, proxy, helper, recovery, and browser suites.
+- [ ] Remove every placeholder/pass-only core integration test.
+- [ ] Run race, load, soak, disk-full, DB-busy, SSH-outage, and shutdown tests.
+- [ ] Run Ruff, strict Pyright, Bandit, dependency audit, pytest, and Playwright in CI.
+- [ ] Rehearse production rollout and rollback from a pinned commit.
 
 ## 33. References
 
-Repository and current behavior:
+Repository and reviewed implementation:
 
 - [AlphaCat00/vscode-gateway](https://github.com/AlphaCat00/vscode-gateway)
-- [Current system overview](https://github.com/AlphaCat00/vscode-gateway/blob/master/design/00-system-overview.md)
-- [Current session orchestrator](https://github.com/AlphaCat00/vscode-gateway/blob/master/src/sessions/orchestrator.ts)
-- [Current editor proxy](https://github.com/AlphaCat00/vscode-gateway/blob/master/src/proxy/proxy.ts)
-- [Current remote helper](https://github.com/AlphaCat00/vscode-gateway/blob/master/src/runtime/ide-gateway-helper-v1.sh)
+- [`Plan.md`](https://github.com/AlphaCat00/vscode-gateway/blob/master/Plan.md)
+- [`src/vscode_gateway/app.py`](https://github.com/AlphaCat00/vscode-gateway/blob/master/src/vscode_gateway/app.py)
+- [`src/vscode_gateway/auth.py`](https://github.com/AlphaCat00/vscode-gateway/blob/master/src/vscode_gateway/auth.py)
+- [`src/vscode_gateway/routes.py`](https://github.com/AlphaCat00/vscode-gateway/blob/master/src/vscode_gateway/routes.py)
+- [`src/vscode_gateway/sessions.py`](https://github.com/AlphaCat00/vscode-gateway/blob/master/src/vscode_gateway/sessions.py)
+- [`src/vscode_gateway/ssh.py`](https://github.com/AlphaCat00/vscode-gateway/blob/master/src/vscode_gateway/ssh.py)
+- [`src/vscode_gateway/runtime.py`](https://github.com/AlphaCat00/vscode-gateway/blob/master/src/vscode_gateway/runtime.py)
+- [`src/vscode_gateway/proxy.py`](https://github.com/AlphaCat00/vscode-gateway/blob/master/src/vscode_gateway/proxy.py)
+- [`tests`](https://github.com/AlphaCat00/vscode-gateway/tree/master/tests)
 
 Primary library and platform documentation:
 
@@ -2739,4 +2543,55 @@ Primary library and platform documentation:
 - [websockets asyncio client](https://websockets.readthedocs.io/en/latest/reference/asyncio/client.html)
 - [aiosqlite](https://aiosqlite.omnilib.dev/)
 - [Python asyncio](https://docs.python.org/3/library/asyncio.html)
-- [AsyncSSH forwarding API, considered but not selected](https://asyncssh.readthedocs.io/en/stable/api.html)
+
+## 34. Implementation audit corrective plan
+
+This section is the release-control summary for the 2026-07-20 static audit. Detailed rationale is in `review.md`.
+
+### 34.1 P0 blockers
+
+- **P0-WS-AUTH:** Authenticate editor WebSockets, validate exact Origin, require registry ownership and DB `ready`, and balance presence exactly once.
+- **P0-RETRY:** Remove alias-lock recursion; await safe cleanup; preserve errored runs when absence is uncertain; release capacity exactly once.
+- **P0-CONFIG:** Validate the temporary candidate with `ssh -F <candidate> -G`; reject failures; serialize writes; publish only committed valid state.
+- **P0-CAPACITY:** Track ownership by session ID, roll back failed acquisition paths, and rebuild from recovery before Open/readiness.
+
+No P1 work is considered release-complete until each P0 has deterministic concurrency and failure-injection tests.
+
+### 34.2 P1 reliability and security
+
+- cancellation-safe Open/Close with an explicit resource ledger;
+- current-state cleanup after startup cancellation, not stale snapshots;
+- real readiness phases and safe degraded/fail-start behavior;
+- state-directory singleton process lock;
+- middleware-only secure cookie, lossless secret encoding, generation validation, login throttling, and CSRF logout;
+- true bidirectional HTTP streaming, `trust_env=False`, repeated-header correctness;
+- bounded subprocess reads and child-process-group cleanup;
+- bounded, locked, atomic artifact cache.
+
+### 34.3 P2 hardening
+
+- filesystem mode/ownership/symlink enforcement;
+- one-time app route/static construction;
+- sanitized client errors and structured diagnostics;
+- complete helper, proxy, recovery, browser, load, soak, disk, and outage suites.
+
+### 34.4 Mandatory release evidence
+
+A release candidate must attach or link:
+
+1. pinned commit hash and dependency lock hash;
+2. Ruff and strict type-check output;
+3. unit/integration/helper/e2e test reports;
+4. security/dependency audit reports;
+5. WebSocket auth/Origin negative-test evidence;
+6. Retry concurrency/deadlock test evidence;
+7. invalid-config preservation and candidate-argv evidence;
+8. restart/capacity/readiness test evidence;
+9. cancellation/resource-leak test evidence;
+10. large-transfer and oversized-subprocess bounded-memory evidence;
+11. second-process refusal evidence;
+12. operator rollback rehearsal record.
+
+### 34.5 Release decision rule
+
+The production decision is **No-Go** when any Critical or High audit item remains open, any core integration test is a placeholder or skipped without an approved environmental reason, recovery can report ready before safe completion, or cleanup cannot account for every owned local and remote resource.

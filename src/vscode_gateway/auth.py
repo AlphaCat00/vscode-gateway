@@ -4,7 +4,7 @@ import secrets
 from datetime import UTC, datetime
 
 from pwdlib import PasswordHash  # type: ignore[import-untyped]
-from starlette.requests import Request
+from starlette.requests import HTTPConnection, Request
 from starlette.responses import Response
 
 from vscode_gateway.settings import Settings
@@ -39,7 +39,7 @@ def generate_csrf_token() -> str:
     return secrets.token_hex(32)
 
 
-def get_csrf_token(request: Request) -> str:
+def get_csrf_token(request: HTTPConnection) -> str:
     session = request.session
     if CSRF_TOKEN_KEY not in session:
         session[CSRF_TOKEN_KEY] = generate_csrf_token()
@@ -59,7 +59,7 @@ def _extract_csrf_from_request(request: Request) -> str | None:
     return header
 
 
-def is_authenticated(request: Request) -> bool:
+def is_authenticated(request: HTTPConnection) -> bool:
     return bool(request.session.get(AUTH_FLAG, False))
 
 

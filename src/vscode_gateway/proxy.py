@@ -217,6 +217,13 @@ class ProxyAdapter:
             headers=upstream_headers,
         )
 
+        # Increment presence only after authorization and successful
+        # upstream connection + downstream accept (plan §16.3 step 8).
+        # The matching decrement is performed by the route handler in its
+        # ``finally`` block, exactly once.
+        if self._session_service is not None:
+            self._session_service.on_client_connected(session_id)
+
         try:
             async with asyncio.TaskGroup() as tg:
                 tg.create_task(self._relay_downstream_to_upstream(downstream, upstream))
