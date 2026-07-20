@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import urlparse
 
 import aiosqlite
 import httpx
@@ -16,6 +17,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
+from vscode_gateway.auth import SecurityHeadersMiddleware
 from vscode_gateway.db import open_database, run_migrations
 from vscode_gateway.errors import GatewayError
 from vscode_gateway.proxy import ProxyAdapter, ProxyRegistry
@@ -193,20 +195,37 @@ def _make_spawner(bg_tasks: BackgroundTaskSet) -> BackgroundSpawner:
     return _spawn
 
 
+def _validate_secure_cookie_settings(settings: Settings) -> None:
+    if not settings.secure_cookies:
+        return
+    scheme = urlparse(settings.canonical_origin).scheme.lower()
+    if scheme != "https":
+        msg = (
+            "secure_cookies is True but canonical_origin is not HTTPS "
+            f"(got {settings.canonical_origin!r}); refusing to start (HI-05)."
+        )
+        raise RuntimeError(msg)
+
+
 def create_app() -> FastAPI:
     settings = Settings()
     configure_logging(settings)
     logger = structlog.get_logger()
 
+    _validate_secure_cookie_settings(settings)
+
     middleware = [
         Middleware(
             SessionMiddleware,
-            secret_key=settings.session_secret.decode("utf-8", errors="replace"),
+            secret_key=settings.session_secret,
             session_cookie="gateway_session",
             max_age=settings.session_max_age_seconds,
-            https_only=False,
+            https_only=settings.secure_cookies,
             same_site="lax",
+            path="/",
+            domain=None,
         ),
+        Middleware(SecurityHeadersMiddleware),
     ]
 
     if settings.allowed_hostnames:

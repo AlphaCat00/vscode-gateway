@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import secrets
+from contextlib import suppress
 from pathlib import Path
 
 from pydantic import Field, model_validator
@@ -63,6 +64,14 @@ class Settings(BaseSettings):
 
     session_max_age_seconds: int = Field(default=86400, ge=60)
 
+    secure_cookies: bool = Field(
+        default=False,
+        description=(
+            "Force Secure/HttpOnly/SameSite on the session cookie. "
+            "Requires an HTTPS canonical origin."
+        ),
+    )
+
     login_max_attempts: int = Field(default=5, ge=1)
     login_window_seconds: float = Field(default=60.0, ge=1.0)
     login_lockout_seconds: float = Field(default=300.0, ge=0.0)
@@ -82,11 +91,45 @@ class Settings(BaseSettings):
         return self
 
     @property
-    def session_secret(self) -> bytes:
+    def session_secret(self) -> str:
+        """Hex-encoded SessionMiddleware signing secret.
+
+        The secret is stored on disk as a hex string so the file can be
+        inspected and edited without the lossy text decoding that random
+        bytes would require (HI-05, Plan §17.2). ``bytes.fromhex`` is the
+        only parser used; malformed or short material fails loudly at
+        startup rather than silently weakening the signer.
+        """
+        return self.session_secret_hex
+
+    @property
+    def session_secret_bytes(self) -> bytes:
+        """Raw signing-key material as ``bytes`` (``>= 32`` bytes)."""
+        return bytes.fromhex(self.session_secret_hex)
+
+    @property
+    def session_secret_hex(self) -> str:
+        path = self.session_secret_path
         try:
-            return self.session_secret_path.read_bytes()
+            text = path.read_text(encoding="utf-8").strip()
         except FileNotFoundError:
             secret = secrets.token_bytes(64)
-            self.session_secret_path.write_bytes(secret)
-            os.chmod(self.session_secret_path, 0o600)
-            return secret
+            hex_text = secret.hex()
+            path.write_text(hex_text, encoding="utf-8")
+            with suppress(OSError):
+                os.chmod(path, 0o600)
+            return hex_text
+        if not text:
+            msg = f"Session secret at {path} is empty; regenerate the file (HI-05)."
+            raise ValueError(msg)
+        try:
+            raw = bytes.fromhex(text)
+        except ValueError as exc:
+            msg = f"Session secret at {path} is not valid hex; regenerate the file (HI-05)."
+            raise ValueError(msg) from exc
+        if len(raw) < 32:
+            msg = (
+                f"Session secret at {path} is {len(raw)} bytes; minimum 32 bytes required (HI-05)."
+            )
+            raise ValueError(msg)
+        return text

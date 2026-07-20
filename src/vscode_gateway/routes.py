@@ -15,11 +15,13 @@ from starlette.responses import Response
 from starlette.websockets import WebSocket
 
 from vscode_gateway.auth import (
+    LoginThrottle,
     clear_session,
     create_session,
     get_csrf_token,
     is_authenticated,
     load_password_hash_from_file,
+    session_generation_matches,
     verify_csrf,
     verify_password,
 )
@@ -47,6 +49,10 @@ def _debug_headers(request: Request) -> dict[str, str]:
 async def require_auth(request: Request) -> None:
     if not is_authenticated(request):
         raise HTTPException(status_code=401, detail="Authentication required")
+    settings: Settings = request.app.state.settings
+    if not session_generation_matches(request, settings):
+        request.session.clear()
+        raise HTTPException(status_code=401, detail="Session no longer valid")
 
 
 async def require_csrf(request: Request) -> None:
@@ -107,6 +113,16 @@ def create_routes(
     router = APIRouter()
     templates = _load_templates()
 
+    login_throttle = LoginThrottle(
+        max_attempts=settings.login_max_attempts,
+        window_seconds=settings.login_window_seconds,
+        lockout_seconds=settings.login_lockout_seconds,
+    )
+
+    def _client_key(request: Request) -> str:
+        client = request.client
+        return client.host if client is not None else "unknown"
+
     # --- Auth routes ---
     @router.get("/login")
     async def login_page(request: Request) -> HTMLResponse:
@@ -120,22 +136,33 @@ def create_routes(
         password: str = Form(...),
         csrf_token: str = Form(...),
     ) -> Response:
+        key = _client_key(request)
+        allowed, retry_after = login_throttle.check(key)
+        if not allowed:
+            return Response(
+                content="Too many login attempts",
+                status_code=429,
+                headers={"Retry-After": str(retry_after)},
+            )
+
         if not verify_csrf(request, csrf_token):
             return HTMLResponse("Invalid CSRF token", status_code=403)
 
         password_hash = load_password_hash_from_file(settings)
         if not verify_password(password, password_hash):
+            login_throttle.record_failure(key)
             return HTMLResponse("Invalid password", status_code=401)
 
-        response: Response = RedirectResponse(url="/", status_code=303)
-        create_session(request, response)
-        return response
+        login_throttle.record_success(key)
+        create_session(request, settings)
+        return RedirectResponse(url="/", status_code=303)
 
-    @router.post("/logout")
-    async def logout(request: Request) -> Response:
-        response: Response = RedirectResponse(url="/login", status_code=303)
-        clear_session(request, response)
-        return response
+    @router.post("/logout", dependencies=[Depends(require_auth)])
+    async def logout(request: Request, csrf_token: str | None = Form(None)) -> Response:
+        if not verify_csrf(request, csrf_token):
+            raise HTTPException(status_code=403, detail="Invalid CSRF token")
+        clear_session(request)
+        return RedirectResponse(url="/login", status_code=303)
 
     # --- Dashboard ---
     @router.get("/", dependencies=[Depends(require_auth)])
