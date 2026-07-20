@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}SSH Keys - OpenVSCode Gateway{% endblock %}
+{% block content %}
+<h2>SSH Keys</h2>
+<div id="keys-section">
+    <h3>Generate New Key</h3>
+    <button id="generate-key" data-csrf="{{ csrf_token }}">Generate Ed25519 Key</button>
+    <div id="generated-key"></div>
+
+    <h3>Existing Keys</h3>
+    <ul id="keys-list">
+        <li>Loading keys...</li>
+    </ul>
+</div>
+<script src="/static/keys.js"></script>
+{% endblock %}

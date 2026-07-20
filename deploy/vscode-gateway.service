@@ -1,0 +1,22 @@
+[Unit]
+Description=OpenVSCode SSH Gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vscode-gateway
+Group=vscode-gateway
+WorkingDirectory=/opt/vscode-gateway
+ExecStart=/opt/vscode-gateway/.venv/bin/uv run uvicorn vscode_gateway.app:create_app --factory --workers 1 --host 127.0.0.1 --port 8000
+Restart=on-failure
+RestartSec=5
+EnvironmentFile=/opt/vscode-gateway/.env
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/opt/vscode-gateway/state /opt/vscode-gateway/config /opt/vscode-gateway/runtime
+
+[Install]
+WantedBy=multi-user.target

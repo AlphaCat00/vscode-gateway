@@ -1,0 +1,334 @@
+*, *::before, *::after {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+:root {
+    --bg: #1e1e2e;
+    --surface: #313244;
+    --overlay: #45475a;
+    --text: #cdd6f4;
+    --subtext: #a6adc8;
+    --accent: #89b4fa;
+    --red: #f38ba8;
+    --green: #a6e3a1;
+    --yellow: #f9e2af;
+    --border: #585b70;
+}
+
+body {
+    font-family: system-ui, -apple-system, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+}
+
+header {
+    background: var(--surface);
+    padding: 0.5rem 1rem;
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    border-bottom: 1px solid var(--border);
+}
+
+header h1 {
+    font-size: 1.2rem;
+}
+
+header h1 a {
+    color: var(--accent);
+    text-decoration: none;
+}
+
+header nav {
+    display: flex;
+    gap: 1rem;
+    flex: 1;
+}
+
+header nav a {
+    color: var(--subtext);
+    text-decoration: none;
+    font-size: 0.9rem;
+}
+
+header nav a:hover {
+    color: var(--text);
+}
+
+.logout-form button {
+    background: transparent;
+    color: var(--subtext);
+    border: 1px solid var(--border);
+    padding: 0.25rem 0.75rem;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.85rem;
+}
+
+.logout-form button:hover {
+    background: var(--overlay);
+    color: var(--text);
+}
+
+main {
+    flex: 1;
+    padding: 1.5rem;
+    max-width: 1200px;
+    width: 100%;
+    margin: 0 auto;
+}
+
+footer {
+    text-align: center;
+    padding: 1rem;
+    color: var(--subtext);
+    font-size: 0.8rem;
+    border-top: 1px solid var(--border);
+}
+
+h2 {
+    margin-bottom: 1rem;
+}
+
+/* Forms */
+.form-group {
+    margin-bottom: 1rem;
+}
+
+label {
+    display: block;
+    margin-bottom: 0.25rem;
+    color: var(--subtext);
+}
+
+input, textarea, button {
+    font-family: inherit;
+    font-size: 0.95rem;
+}
+
+input[type="password"],
+input[type="text"] {
+    width: 100%;
+    max-width: 320px;
+    padding: 0.5rem;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--surface);
+    color: var(--text);
+}
+
+textarea {
+    width: 100%;
+    padding: 0.75rem;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--surface);
+    color: var(--text);
+    font-family: monospace;
+    font-size: 0.9rem;
+    resize: vertical;
+}
+
+button {
+    padding: 0.5rem 1rem;
+    border: 1px solid var(--accent);
+    border-radius: 4px;
+    background: var(--accent);
+    color: var(--bg);
+    cursor: pointer;
+    font-weight: 500;
+}
+
+button:hover {
+    opacity: 0.9;
+}
+
+button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+button.danger {
+    background: var(--red);
+    border-color: var(--red);
+}
+
+/* Login page */
+.login-page {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.login-page main {
+    background: var(--surface);
+    padding: 2rem;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    max-width: 400px;
+}
+
+.login-page h1 {
+    margin-bottom: 1.5rem;
+    text-align: center;
+}
+
+.login-page button {
+    width: 100%;
+    margin-top: 0.5rem;
+}
+
+/* Workspace cards */
+#workspaces-container {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+}
+
+.workspace-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1rem;
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+}
+
+.workspace-card .alias {
+    font-weight: 600;
+    flex: 1;
+    min-width: 120px;
+}
+
+.workspace-card .status {
+    padding: 0.15rem 0.5rem;
+    border-radius: 4px;
+    font-size: 0.8rem;
+    font-weight: 500;
+    text-transform: uppercase;
+}
+
+.status-ready { background: var(--green); color: var(--bg); }
+.status-starting { background: var(--yellow); color: var(--bg); }
+.status-stopping { background: var(--overlay); color: var(--text); }
+.status-error { background: var(--red); color: var(--bg); }
+.status-closed { background: var(--overlay); color: var(--subtext); }
+
+.workspace-card .stage {
+    color: var(--subtext);
+    font-size: 0.85rem;
+    min-width: 80px;
+}
+
+.workspace-card .clients {
+    color: var(--subtext);
+    font-size: 0.85rem;
+}
+
+.workspace-card .actions {
+    display: flex;
+    gap: 0.5rem;
+}
+
+.workspace-card .actions button {
+    font-size: 0.85rem;
+    padding: 0.3rem 0.75rem;
+}
+
+.workspace-card .error-msg {
+    color: var(--red);
+    font-size: 0.8rem;
+    flex-basis: 100%;
+}
+
+/* SSH config page */
+#config-editor {
+    margin-bottom: 1.5rem;
+}
+
+#config-errors {
+    font-size: 0.85rem;
+    margin: 0.5rem 0;
+}
+
+#config-errors .error-msg {
+    color: var(--red);
+}
+
+#config-errors .success-msg {
+    color: var(--green);
+}
+
+#alias-list {
+    list-style: none;
+}
+
+#alias-list li {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.4rem 0.75rem;
+    margin-bottom: 0.4rem;
+    font-family: monospace;
+    font-size: 0.9rem;
+}
+
+#alias-list li.error-msg {
+    color: var(--red);
+    border-color: var(--red);
+    font-family: inherit;
+}
+
+/* Keys page */
+#keys-section h3 {
+    margin: 1.5rem 0 0.5rem;
+}
+
+#keys-list {
+    list-style: none;
+}
+
+#keys-list li {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.5rem 0.75rem;
+    margin-bottom: 0.5rem;
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+}
+
+#keys-list .key-name {
+    font-weight: 600;
+    flex: 1;
+}
+
+#keys-list .key-fingerprint {
+    color: var(--subtext);
+    font-family: monospace;
+    font-size: 0.8rem;
+}
+
+#keys-list .key-algorithm {
+    color: var(--subtext);
+    font-size: 0.85rem;
+}
+
+.code-block {
+    background: var(--overlay);
+    border-radius: 4px;
+    padding: 0.75rem;
+    font-family: monospace;
+    font-size: 0.85rem;
+    margin: 0.5rem 0;
+    overflow-x: auto;
+    white-space: pre-wrap;
+    word-break: break-all;
+}

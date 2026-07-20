@@ -1,0 +1,3 @@
+#!/bin/sh
+# Fake scp for integration tests
+exit 0

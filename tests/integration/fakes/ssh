@@ -1,0 +1,48 @@
+#!/bin/sh
+# Fake SSH for integration tests
+case "$*" in
+    *capabilities*)
+        echo '{"platform":"linux","arch":"x86_64","helper_version":"1","available":true}'
+        exit 0
+        ;;
+    *runtime-inspect*)
+        echo '{"installed":false}'
+        exit 0
+        ;;
+    *runtime-install*)
+        echo '{"installed":true,"path":"/fake/runtime","version":"1.0.0"}'
+        exit 0
+        ;;
+    *"session-start"*)
+        echo '{"pid":12345,"port":9001,"boot_id":"fake-boot","process_start_id":"100","executable":"/fake/bin/openvscode-server","session_dir":"/fake/sessions/test"}'
+        exit 0
+        ;;
+    *"session-inspect"*)
+        echo '{"running":true,"pid":12345,"port":9001,"boot_id":"fake-boot","process_start_id":"100","executable":"/fake/bin/openvscode-server","identity_ok":true}'
+        exit 0
+        ;;
+    *"session-stop"*)
+        echo '{"stopped":true,"pid":12345}'
+        exit 0
+        ;;
+    *"session-remove"*)
+        echo '{"removed":true}'
+        exit 0
+        ;;
+    *"session-list"*)
+        echo '{"sessions":[]}'
+        exit 0
+        ;;
+    *"-G"*)
+        # ssh -G alias validation: always succeed
+        exit 0
+        ;;
+    *"-L"*)
+        # SSH tunnel: stay alive briefly then exit
+        sleep 30
+        exit 0
+        ;;
+    *)
+        exit 0
+        ;;
+esac

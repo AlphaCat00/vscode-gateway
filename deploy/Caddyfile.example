@@ -1,0 +1,25 @@
+# Caddyfile for OpenVSCode SSH Gateway
+# Terminates TLS and proxies to the gateway Uvicorn process.
+
+gateway.example.com {
+    reverse_proxy 127.0.0.1:8000 {
+        header_up Host {host}
+        header_up X-Forwarded-Proto https
+        flush_interval -1
+    }
+
+    @websockets {
+        header Connection *Upgrade*
+        header Upgrade *websocket*
+    }
+    reverse_proxy @websockets 127.0.0.1:8000
+
+    request_body {
+        max_size 10MB
+    }
+
+    log {
+        output file /var/log/caddy/gateway.log
+        level INFO
+    }
+}

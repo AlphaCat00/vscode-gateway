@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}SSH Config - OpenVSCode Gateway{% endblock %}
+{% block content %}
+<h2>SSH Configuration</h2>
+<div id="config-editor">
+    <textarea id="config-text" rows="20" spellcheck="false">{{ config_text }}</textarea>
+    <input type="hidden" id="config-revision" value="{{ revision }}">
+    <div id="config-errors"></div>
+    <button id="save-config" data-csrf="{{ csrf_token }}">Save Configuration</button>
+</div>
+<h3>Discovered Aliases</h3>
+<ul id="alias-list">
+    <li>Loading aliases...</li>
+</ul>
+<script src="/static/ssh_config.js"></script>
+{% endblock %}

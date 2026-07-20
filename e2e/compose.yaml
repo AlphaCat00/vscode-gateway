@@ -1,0 +1,12 @@
+services:
+  gateway:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      VSC_GATEWAY_PASSWORD_HASH: "test-hash"
+    volumes:
+      - ./config:/app/config
+      - ./state:/app/state

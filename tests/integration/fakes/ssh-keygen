@@ -1,0 +1,4 @@
+#!/bin/sh
+# Fake ssh-keygen for integration tests
+echo "ssh-ed25519 AAAAFakeKey000000000000000000000000000000000000000000 test-key"
+exit 0
