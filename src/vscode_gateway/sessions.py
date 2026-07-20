@@ -5,6 +5,7 @@ import uuid
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -42,6 +43,26 @@ from vscode_gateway.proxy import ProxyRegistry
 from vscode_gateway.runtime import RuntimeService
 from vscode_gateway.settings import Settings
 from vscode_gateway.ssh import SshCatalog, start_local_forward
+
+
+@dataclass
+class _OpenLedger:
+    """Operation-local resource ledger for one ``_do_open`` invocation.
+
+    Tracks each acquired resource so cancellation-safe and exception-safe
+    cleanup runs in reverse order of acquisition and never acts on
+    resources that were never created (Plan §14.1). Capacity lifetime is
+    governed separately by the HI-01 ledger keyed on session ID.
+    """
+
+    session_id: SessionId
+    alias: str
+    remote_started: bool = False
+    remote_identity_persisted: bool = False
+    tunnel_started: bool = False
+    tunnel_identity_persisted: bool = False
+    registry_added: bool = False
+    ready_task: asyncio.Task[None] | None = None
 
 
 class SessionService:
@@ -176,15 +197,37 @@ class SessionService:
             return self._to_view(session)
 
     async def _run_open(self, session_id: SessionId, alias: str) -> None:
+        # The task wrapper owns the single durable transition from an
+        # unexpected exception to a sanitized ``error`` row (Plan §14.1
+        # step 5). ``_do_open`` performs the bulk of the cleanup contract
+        # itself; this defensive layer exists so that a programming bug
+        # raised from inside ``_do_open`` (e.g. during cleanup) cannot
+        # leave a durable ``starting`` row.
         try:
             await self._do_open(session_id, alias)
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
-            logger = structlog.get_logger()
-            logger.error("open_task_failed", session_id=str(session_id), error=str(exc))
+            structlog.get_logger().error(
+                "open_task_unhandled",
+                session_id=str(session_id),
+                error=str(exc),
+            )
+            with suppress(Exception):
+                existing = await get_session(self._db, str(session_id))
+                if existing is not None and existing.state == SessionState.STARTING:
+                    await mark_error(
+                        self._db,
+                        str(session_id),
+                        ErrorCode.INTERNAL_ERROR.value,
+                        "Internal error during open",
+                        stage=SessionStage.STOP,
+                    )
         finally:
             self._start_tasks.pop(session_id, None)
 
     async def _do_open(self, session_id: SessionId, alias: str) -> SessionView:
+        ledger = _OpenLedger(session_id=session_id, alias=alias)
         try:
             await update_session_stage(self._db, str(session_id), SessionStage.VALIDATE)
             capabilities = await self._runtime.capabilities(alias)
@@ -194,6 +237,7 @@ class SessionService:
 
             await update_session_stage(self._db, str(session_id), SessionStage.START_REMOTE)
             remote = await self._runtime.start_session(alias, session_id)
+            ledger.remote_started = True
             await set_remote_identity(
                 self._db,
                 str(session_id),
@@ -203,53 +247,139 @@ class SessionService:
                 remote.process_start_id,
                 remote.executable,
             )
+            ledger.remote_identity_persisted = True
 
             await update_session_stage(self._db, str(session_id), SessionStage.START_TUNNEL)
             tunnel_identity, tunnel_proc = await start_local_forward(
                 self._settings, alias, remote.port
             )
-            await set_tunnel_identity(
-                self._db,
-                str(session_id),
-                tunnel_identity.local_port,
-                tunnel_identity.pid,
+            ledger.tunnel_started = True
+            await asyncio.shield(
+                set_tunnel_identity(
+                    self._db,
+                    str(session_id),
+                    tunnel_identity.local_port,
+                    tunnel_identity.pid,
+                )
             )
+            ledger.tunnel_identity_persisted = True
             self._tunnel_processes[session_id] = tunnel_proc
             self._registry.add(session_id, tunnel_identity.local_port)
+            ledger.registry_added = True
 
             await update_session_stage(self._db, str(session_id), SessionStage.VERIFY)
             await self._verify_editor_health(session_id, tunnel_identity.local_port)
 
-            await mark_ready(self._db, str(session_id))
-            self._start_tasks.pop(session_id, None)
+            # The final readiness commit is shielded so a shutdown-induced
+            # cancellation arriving at the moment of completion cannot
+            # leave the row in ``starting`` while the resources are live.
+            # The shielded task is awaited via ``_await_ready_commit`` so
+            # cancellation cleanup can still observe the final outcome
+            # before deciding whether to preserve or tear down resources.
+            ready_task = asyncio.ensure_future(mark_ready(self._db, str(session_id)))
+            ledger.ready_task = ready_task
+            await asyncio.shield(ready_task)
+            return self._to_view(await self._finalize_open_read(session_id, ready_task))
 
-            record = await get_session(self._db, str(session_id))
-            if record is None:
-                raise GatewayError(ErrorCode.INTERNAL_ERROR, "Session disappeared after ready")
-            return self._to_view(record)
-
+        except asyncio.CancelledError:
+            await self._open_failure_cleanup(ledger, ErrorCode.INTERNAL_ERROR, "Open cancelled")
+            raise
         except GatewayError as exc:
-            if exc.code != ErrorCode.CAPACITY_REACHED and exc.code != ErrorCode.ALIAS_NOT_FOUND:
-                await self._best_effort_cleanup(
-                    session_id,
-                    str(exc.code)
-                    in (
-                        ErrorCode.REMOTE_START_FAILED,
-                        ErrorCode.TUNNEL_START_FAILED,
-                        ErrorCode.STARTUP_TIMEOUT,
-                    ),
-                )
-                existing = await get_session(self._db, str(session_id))
-                if existing is not None:
-                    await mark_error(
+            if exc.code not in (ErrorCode.CAPACITY_REACHED, ErrorCode.ALIAS_NOT_FOUND):
+                await self._open_failure_cleanup(ledger, exc.code, exc.safe_message)
+            raise
+        except Exception as exc:
+            structlog.get_logger().error(
+                "open_internal_error",
+                session_id=str(session_id),
+                error=str(exc),
+            )
+            await self._open_failure_cleanup(
+                ledger, ErrorCode.INTERNAL_ERROR, "Internal error during open"
+            )
+            raise
+
+    async def _finalize_open_read(
+        self,
+        session_id: SessionId,
+        ready_task: asyncio.Task[None],
+    ) -> SessionRecord:
+        with suppress(asyncio.CancelledError, Exception):
+            if not ready_task.done():
+                await ready_task
+        record = await get_session(self._db, str(session_id))
+        if record is None:
+            raise GatewayError(ErrorCode.INTERNAL_ERROR, "Session disappeared after ready")
+        return record
+
+    async def _open_failure_cleanup(
+        self,
+        ledger: _OpenLedger,
+        code: ErrorCode,
+        message: str,
+    ) -> None:
+        # If the mark_ready commit was already in flight, the shielded
+        # transaction will complete regardless of cancellation. Wait for
+        # that outcome so cleanup does not race the final commit: if the
+        # row is now ``ready`` the resources are live and must be
+        # preserved for close()/retry() to reclaim (Plan §14.1 step 4).
+        ready_task = ledger.ready_task
+        if ready_task is not None:
+            with suppress(asyncio.CancelledError, Exception):
+                if not ready_task.done():
+                    await ready_task
+            existing = await get_session(self._db, str(ledger.session_id))
+            if existing is not None and existing.state == SessionState.READY:
+                # The session transitioned to ready despite cancellation;
+                # resources and capacity must remain owned by this row.
+                return
+
+        # Reverse-order cleanup relative to acquisition: registry, tunnel,
+        # then remote. Best-effort only; each step swallows further errors
+        # so a single failure cannot prevent subsequent steps.
+        if ledger.registry_added:
+            with suppress(Exception):
+                self._registry.remove(ledger.session_id)
+            ledger.registry_added = False
+
+        tunnel = self._tunnel_processes.pop(ledger.session_id, None)
+        if tunnel is not None:
+            ledger.tunnel_started = False
+            with suppress(Exception):
+                tunnel.terminate()
+                try:
+                    await asyncio.wait_for(tunnel.wait(), timeout=5.0)
+                except TimeoutError:
+                    tunnel.kill()
+                    with suppress(Exception):
+                        await tunnel.wait()
+            structlog.get_logger().info(
+                "open_cleanup_tunnel_stopped",
+                session_id=str(ledger.session_id),
+            )
+
+        if ledger.remote_started:
+            with suppress(Exception):
+                await self._runtime.stop_session(ledger.alias, ledger.session_id)
+            ledger.remote_started = False
+
+        # Preserve durable evidence: mark the row ``error`` with a
+        # sanitized code/message. Capacity remains owned by this session
+        # ID because the error row is resource-bearing and stays until
+        # close()/retry() deletes it and calls ``_capacity_release``
+        # exactly once (Plan §14.6).
+        with suppress(Exception):
+            existing = await get_session(self._db, str(ledger.session_id))
+            if existing is not None and existing.state != SessionState.READY:
+                await asyncio.shield(
+                    mark_error(
                         self._db,
-                        str(session_id),
-                        exc.code.value,
-                        exc.safe_message,
+                        str(ledger.session_id),
+                        code.value,
+                        message,
                         stage=SessionStage.STOP,
                     )
-            self._start_tasks.pop(session_id, None)
-            raise
+                )
 
     async def close(
         self,
@@ -595,22 +725,6 @@ class SessionService:
                 f"Cannot reach editor: {exc}",
                 status_code=502,
             ) from exc
-
-    async def _best_effort_cleanup(
-        self, session_id: SessionId, has_resources: bool = False
-    ) -> None:
-        self._registry.remove(session_id)
-        tunnel = self._tunnel_processes.pop(session_id, None)
-        if tunnel is not None:
-            try:
-                tunnel.terminate()
-                try:
-                    await asyncio.wait_for(tunnel.wait(), timeout=5.0)
-                except TimeoutError:
-                    tunnel.kill()
-                    await tunnel.wait()
-            except (ProcessLookupError, TimeoutError):
-                pass
 
     def _cancel_start(self, session_id: SessionId) -> None:
         task = self._start_tasks.pop(session_id, None)
