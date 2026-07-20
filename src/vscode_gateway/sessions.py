@@ -60,11 +60,12 @@ class SessionService:
         self._registry = proxy_registry
 
         self._alias_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
-        # Simple non-blocking capacity counter. asyncio.Semaphore has no
-        # ``acquire_nowait``; we run single-threaded inside the event loop
-        # so a plain integer is sufficient.
+        # Capacity ownership ledger keyed by session ID. Per Plan §14.6 the
+        # ledger is the source of truth for who owns a slot; an anonymous
+        # integer cannot be rolled back safely on failure or rebuilt from
+        # persisted rows during recovery.
         self._capacity_total: int = settings.session_capacity
-        self._capacity_used: int = 0
+        self._capacity_owned: set[SessionId] = set()
 
         self._tunnel_processes: dict[SessionId, asyncio.subprocess.Process] = {}
         self._grace_timers: dict[SessionId, asyncio.Task[None]] = {}
@@ -91,15 +92,17 @@ class SessionService:
         task.add_done_callback(_done)
         return task
 
-    # --- Capacity counter ---
-    def _capacity_acquire(self) -> None:
-        if self._capacity_used >= self._capacity_total:
+    # --- Capacity ownership ledger (Plan §14.6) ---
+    def _capacity_acquire(self, session_id: SessionId) -> None:
+        if session_id in self._capacity_owned:
+            structlog.get_logger().warning("capacity_acquire_duplicate", session_id=str(session_id))
+            return
+        if len(self._capacity_owned) >= self._capacity_total:
             raise RuntimeError("capacity reached")
-        self._capacity_used += 1
+        self._capacity_owned.add(session_id)
 
-    def _capacity_release(self) -> None:
-        if self._capacity_used > 0:
-            self._capacity_used -= 1
+    def _capacity_release(self, session_id: SessionId) -> None:
+        self._capacity_owned.discard(session_id)
 
     def _get_lock(self, alias: str) -> asyncio.Lock:
         return self._alias_locks[alias]
@@ -125,14 +128,12 @@ class SessionService:
                         status_code=409,
                     )
 
-            try:
-                self._capacity_acquire()
-            except RuntimeError as exc:
+            if len(self._capacity_owned) >= self._capacity_total:
                 raise GatewayError(
                     ErrorCode.CAPACITY_REACHED,
                     "Session capacity reached; close an existing session first",
                     status_code=429,
-                ) from exc
+                )
 
             session_id = uuid.uuid4()
             session = SessionRecord(
@@ -142,6 +143,20 @@ class SessionService:
                 stage=SessionStage.VALIDATE,
             )
             await insert_session(self._db, session)
+
+            # Reserve capacity for this specific session ID only after the
+            # row is durable. If acquisition fails (capacity was taken
+            # while we awaited insert), roll back the row.
+            try:
+                self._capacity_acquire(session_id)
+            except RuntimeError as exc:
+                with suppress(Exception):
+                    await delete_session(self._db, str(session_id))
+                raise GatewayError(
+                    ErrorCode.CAPACITY_REACHED,
+                    "Session capacity reached; close an existing session first",
+                    status_code=429,
+                ) from exc
 
             # Spawn the slow _do_open work in the background so the HTTP
             # route can return 202 immediately. _do_open is responsible for
@@ -295,8 +310,9 @@ class SessionService:
             await self._runtime.remove_session(session.alias, session_id)
 
         await delete_session(self._db, str(session_id))
-        with suppress(ValueError):
-            self._capacity_release()
+        # Release this session's capacity reservation only after the row is
+        # gone and resources are confirmed absent (Plan §14.2 step 9).
+        self._capacity_release(session_id)
 
         self._connected_counts.pop(session_id, None)
 
@@ -352,6 +368,13 @@ class SessionService:
 
     async def recover_all(self) -> RecoveryReport:
         sessions = await list_sessions(self._db)
+
+        # Rebuild the capacity ownership ledger from persisted rows before
+        # accepting mutations so recovery matches Plan §14.6: every
+        # resource-bearing row (all durable rows here) counts against
+        # capacity. Deletes during recovery remove the corresponding id.
+        self._capacity_owned = {record.id for record in sessions}
+
         recovered = 0
         failed = 0
         cleaned = 0
@@ -380,8 +403,7 @@ class SessionService:
                             else:
                                 await delete_session(self._db, str(record.id))
                                 cleaned += 1
-                                with suppress(ValueError):
-                                    self._capacity_release()
+                                self._capacity_release(record.id)
                         else:
                             await mark_error(
                                 self._db,
@@ -435,8 +457,7 @@ class SessionService:
                         if not insp.get("running"):
                             await delete_session(self._db, str(record.id))
                             cleaned += 1
-                            with suppress(ValueError):
-                                self._capacity_release()
+                            self._capacity_release(record.id)
 
                 except Exception:
                     await mark_error(
