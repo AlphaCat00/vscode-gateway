@@ -20,6 +20,7 @@ from starlette.responses import JSONResponse, Response
 from vscode_gateway.auth import SecurityHeadersMiddleware
 from vscode_gateway.db import open_database, run_migrations
 from vscode_gateway.errors import GatewayError
+from vscode_gateway.lockfile import ProcessLock, check_multi_worker_env
 from vscode_gateway.proxy import ProxyAdapter, ProxyRegistry
 from vscode_gateway.readiness import Readiness, ReadinessPhase, UnresolvedCounts
 from vscode_gateway.routes import create_routes
@@ -73,13 +74,24 @@ async def lifespan(app: FastAPI):
     bg_tasks: BackgroundTaskSet = set()
     http_client: httpx.AsyncClient | None = None
     db: aiosqlite.Connection | None = None
+    process_lock: ProcessLock | None = None
 
     # Phase starts as ``starting``. Any failure in the mandatory startup
-    # sequence (DB open, migrations, catalog init, capacity rebuild,
-    # recovery) reports a bounded ``degraded`` state and continues
-    # serving 503 rather than crashing, so a load balancer sees the
-    # failure signal and operators can inspect /readyz (HI-04).
+    # sequence (singleton lock, DB open, migrations, catalog init,
+    # capacity rebuild, recovery) reports a bounded ``degraded`` state
+    # and continues serving 503 rather than crashing, so a load balancer
+    # sees the failure signal and operators can inspect /readyz (HI-04).
     try:
+        # HI-07: acquire the OS singleton lock **before** opening any
+        # mutable service (DB, sessions, http client) and hold it for
+        # the entire process lifetime. A second worker or instance
+        # sharing this state directory fails fast with ``BlockingIOError``
+        # and is reported as a degraded startup so /readyz surfaces the
+        # condition (Plan §6.1).
+        process_lock = ProcessLock(settings.state_dir)
+        process_lock.acquire()
+        app.state.process_lock = process_lock  # type: ignore[assignment]  # state is Any
+
         db = await open_database(settings.state_dir / "gateway.db")
         migrations_dir = Path(__file__).parent / "migrations"
         await run_migrations(db, migrations_dir)
@@ -181,6 +193,8 @@ async def lifespan(app: FastAPI):
         await http_client.aclose()
     if db is not None:
         await db.close()
+    if process_lock is not None:
+        process_lock.release()
 
 
 def _make_spawner(bg_tasks: BackgroundTaskSet) -> BackgroundSpawner:
@@ -220,6 +234,7 @@ def create_app() -> FastAPI:
     logger = structlog.get_logger()
 
     _validate_secure_cookie_settings(settings)
+    check_multi_worker_env()
 
     middleware = [
         Middleware(
