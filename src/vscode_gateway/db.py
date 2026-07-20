@@ -186,6 +186,28 @@ async def set_tunnel_identity(
     await db.commit()
 
 
+async def clear_remote_identity(db: aiosqlite.Connection, session_id: str) -> None:
+    now = datetime.now(UTC).isoformat()
+    await db.execute(
+        """UPDATE sessions SET
+            remote_pid = NULL, remote_port = NULL, remote_boot_id = NULL,
+            remote_process_start_id = NULL, remote_executable = NULL,
+            updated_at = ?
+        WHERE id = ?""",
+        (now, session_id),
+    )
+    await db.commit()
+
+
+async def clear_tunnel_identity(db: aiosqlite.Connection, session_id: str) -> None:
+    now = datetime.now(UTC).isoformat()
+    await db.execute(
+        "UPDATE sessions SET local_port = NULL, tunnel_pid = NULL, updated_at = ? WHERE id = ?",
+        (now, session_id),
+    )
+    await db.commit()
+
+
 async def mark_ready(db: aiosqlite.Connection, session_id: str) -> None:
     now = datetime.now(UTC).isoformat()
     await db.execute(

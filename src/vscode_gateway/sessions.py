@@ -13,6 +13,8 @@ import aiosqlite
 import structlog
 
 from vscode_gateway.db import (
+    clear_remote_identity,
+    clear_tunnel_identity,
     delete_session,
     get_session,
     get_session_by_alias,
@@ -345,6 +347,7 @@ class SessionService:
         tunnel = self._tunnel_processes.pop(ledger.session_id, None)
         if tunnel is not None:
             ledger.tunnel_started = False
+            tunnel_terminated_ok = True
             with suppress(Exception):
                 tunnel.terminate()
                 try:
@@ -357,11 +360,22 @@ class SessionService:
                 "open_cleanup_tunnel_stopped",
                 session_id=str(ledger.session_id),
             )
+            if tunnel_terminated_ok and ledger.tunnel_identity_persisted:
+                with suppress(Exception):
+                    await asyncio.shield(clear_tunnel_identity(self._db, str(ledger.session_id)))
+                ledger.tunnel_identity_persisted = False
 
         if ledger.remote_started:
-            with suppress(Exception):
+            remote_stopped_ok = True
+            try:
                 await self._runtime.stop_session(ledger.alias, ledger.session_id)
+            except Exception:
+                remote_stopped_ok = False
             ledger.remote_started = False
+            if remote_stopped_ok and ledger.remote_identity_persisted:
+                with suppress(Exception):
+                    await asyncio.shield(clear_remote_identity(self._db, str(ledger.session_id)))
+                ledger.remote_identity_persisted = False
 
         # Preserve durable evidence: mark the row ``error`` with a
         # sanitized code/message. Capacity remains owned by this session
@@ -391,17 +405,44 @@ class SessionService:
             if session is None:
                 return
 
-            await mark_stopping(self._db, str(session.id), reason.value)
-            self._cancel_start(session.id)
-            self._cancel_grace(session.id)
-            self._registry.remove(session.id)
+            session_id = session.id
+            await mark_stopping(self._db, str(session_id), reason.value)
+            self._cancel_grace(session_id)
+            self._registry.remove(session_id)
+
+            # Cancel and *await* the start task before deciding what to
+            # clean up (Plan §14.2 step 3, HI-03). The start task runs
+            # without the alias lock, so awaiting it inside the lock is
+            # safe; its cancellation cleanup contract completes so the
+            # row's persisted identity reflects whatever resources the
+            # operation actually acquired.
+            start_task = self._start_tasks.pop(session_id, None)
+            if start_task is not None:
+                start_task.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await start_task
+
             close_session = session
 
-        # Run the slow cleanup work in the background; route returns 204.
+        # Slow cleanup runs in the background; route returns 202.
         self._spawn(self._do_close(close_session))
 
     async def _do_close(self, session: SessionRecord) -> None:
         session_id = session.id
+
+        # Re-read the row by session id at the start of cleanup. Decisions
+        # must use the current persisted identity/state, not the stale
+        # snapshot captured before the start task settled (HI-03,
+        # Plan §14.2 step 4). The start task has either finished its own
+        # cleanup (clearing identity) or never persisted any; in both
+        # cases the fresh snapshot is authoritative.
+        fresh = await get_session(self._db, str(session_id))
+        if fresh is None:
+            # Row already gone: whoever deleted it owns capacity release.
+            self._capacity_release(session_id)
+            self._connected_counts.pop(session_id, None)
+            return
+
         errors: list[str] = []
 
         tunnel = self._tunnel_processes.pop(session_id, None)
@@ -418,9 +459,13 @@ class SessionService:
             except Exception as exc:
                 errors.append(f"Tunnel termination error: {exc}")
 
-        if session.remote_pid and session.state != SessionState.STARTING:
+        # Stop the remote managed session by session id whenever identity
+        # is persisted, regardless of the pre-close state. HI-03: do not
+        # skip remote inspection solely because an earlier snapshot had no
+        # PID; the fresh snapshot determines absence (Plan §14.2 step 6).
+        if fresh.remote_pid:
             try:
-                await self._runtime.stop_session(session.alias, session_id)
+                await self._runtime.stop_session(fresh.alias, session_id)
             except GatewayError as exc:
                 errors.append(exc.safe_message)
             except Exception as exc:
@@ -434,10 +479,12 @@ class SessionService:
                 "; ".join(errors),
                 stage=SessionStage.STOP,
             )
+            # Row retained as error/stop_failed; capacity stays owned
+            # (Plan §14.6).
             return
 
         with suppress(Exception):
-            await self._runtime.remove_session(session.alias, session_id)
+            await self._runtime.remove_session(fresh.alias, session_id)
 
         await delete_session(self._db, str(session_id))
         # Release this session's capacity reservation only after the row is
@@ -725,11 +772,6 @@ class SessionService:
                 f"Cannot reach editor: {exc}",
                 status_code=502,
             ) from exc
-
-    def _cancel_start(self, session_id: SessionId) -> None:
-        task = self._start_tasks.pop(session_id, None)
-        if task is not None:
-            task.cancel()
 
     def _cancel_grace(self, session_id: SessionId) -> None:
         task = self._grace_timers.pop(session_id, None)
