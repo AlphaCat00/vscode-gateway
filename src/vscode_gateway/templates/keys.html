@@ -3,14 +3,49 @@
 {% block content %}
 <h2>SSH Keys</h2>
 <div id="keys-section">
-    <h3>Generate New Key</h3>
-    <button id="generate-key" data-csrf="{{ csrf_token }}">Generate Ed25519 Key</button>
-    <div id="generated-key"></div>
+    <p id="keys-status" role="status" aria-live="polite" aria-atomic="true"></p>
 
-    <h3>Existing Keys</h3>
-    <ul id="keys-list">
-        <li>Loading keys...</li>
-    </ul>
+    <section aria-labelledby="upload-key-heading">
+        <h3 id="upload-key-heading">Upload an SSH key</h3>
+        <p id="upload-key-help">
+            Upload at most one Ed25519, one RSA, and one ECDSA private key.
+            Encrypted private keys are not supported. The gateway tries all
+            uploaded keys automatically.
+        </p>
+        <form
+            id="key-upload-form"
+            aria-describedby="upload-key-help"
+            enctype="multipart/form-data"
+        >
+            <div class="form-group">
+                <label for="key-name">Name</label>
+                <input id="key-name" name="name" type="text" required autocomplete="off">
+            </div>
+            <div class="form-group">
+                <label for="private-key-file">Private key file</label>
+                <input id="private-key-file" name="private_key" type="file" required>
+            </div>
+            <button id="upload-key" type="submit">Upload key</button>
+        </form>
+    </section>
+
+    <section aria-labelledby="uploaded-keys-heading">
+        <h3 id="uploaded-keys-heading">Uploaded keys</h3>
+        <ul id="keys-list">
+            <li id="key-slot-ed25519" data-key-type="ed25519">
+                <h4>Ed25519</h4>
+                <div class="key-slot-content"><p>Loading...</p></div>
+            </li>
+            <li id="key-slot-rsa" data-key-type="rsa">
+                <h4>RSA</h4>
+                <div class="key-slot-content"><p>Loading...</p></div>
+            </li>
+            <li id="key-slot-ecdsa" data-key-type="ecdsa">
+                <h4>ECDSA</h4>
+                <div class="key-slot-content"><p>Loading...</p></div>
+            </li>
+        </ul>
+    </section>
 </div>
 <script src="/static/keys.js"></script>
 {% endblock %}

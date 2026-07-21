@@ -2,14 +2,27 @@
 {% block title %}SSH Config - OpenVSCode Gateway{% endblock %}
 {% block content %}
 <h2>SSH Configuration</h2>
-<div id="config-editor">
-    <textarea id="config-text" rows="20" spellcheck="false">{{ config_text }}</textarea>
+<p id="config-guidance">
+    Connection targets come from <code>Host</code> entries. Uploaded keys are
+    automatically tried for every connection. Do not configure
+    <code>IdentityFile</code> or <code>IdentityAgent</code>.
+    <code>RemoteCommand</code> is supported.
+</p>
+<div id="config-editor" aria-busy="false">
+    <label for="config-text">SSH configuration</label>
+    <textarea
+        id="config-text"
+        rows="20"
+        spellcheck="false"
+        aria-describedby="config-guidance config-status config-errors"
+    >{{ config_text }}</textarea>
     <input type="hidden" id="config-revision" value="{{ revision }}">
-    <div id="config-errors"></div>
-    <button id="save-config" data-csrf="{{ csrf_token }}">Save Configuration</button>
+    <div id="config-status" role="status" aria-live="polite" aria-atomic="true"></div>
+    <div id="config-errors" role="alert" aria-live="assertive" aria-atomic="true"></div>
+    <button id="save-config" type="button" aria-controls="config-text">Save Configuration</button>
 </div>
-<h3>Discovered Aliases</h3>
-<ul id="alias-list">
+<h3 id="alias-heading">Discovered Aliases</h3>
+<ul id="alias-list" aria-labelledby="alias-heading" aria-live="polite" aria-busy="true">
     <li>Loading aliases...</li>
 </ul>
 <script src="/static/ssh_config.js"></script>

@@ -34,7 +34,7 @@ from vscode_gateway.ssh_keys import SshKeyService
 
 
 def _csrf_from_html(text: str) -> str:
-    match = re.search(r'data-csrf="([^"]+)"', text)
+    match = re.search(r'<meta name="csrf-token" content="([^"]+)"', text)
     if match is None:
         raise AssertionError("authenticated page did not contain a CSRF token")
     return match.group(1)
@@ -118,7 +118,24 @@ async def test_key_routes_keep_fixed_slots_and_multipart_contract(tmp_path: Path
                 assert login.status_code == 303
 
                 keys_page = await client.get("/settings/keys")
+                assert keys_page.status_code == 200
+                assert 'name="name"' in keys_page.text
+                assert 'name="private_key"' in keys_page.text
+                for key_type in ("ed25519", "rsa", "ecdsa"):
+                    assert f'id="key-slot-{key_type}"' in keys_page.text
+                assert "generate-key" not in keys_page.text
+                assert "Generate" not in keys_page.text
+                assert "data-csrf" not in keys_page.text
                 csrf = _csrf_from_html(keys_page.text)
+
+                config_page = await client.get("/settings/ssh")
+                assert config_page.status_code == 200
+                assert "automatically tried" in config_page.text
+                assert "IdentityFile" in config_page.text
+                assert "IdentityAgent" in config_page.text
+                assert "RemoteCommand" in config_page.text
+                assert "data-csrf" not in config_page.text
+
                 empty = await client.get("/api/ssh/keys")
                 assert empty.status_code == 200
                 assert empty.json() == {

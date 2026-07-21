@@ -332,3 +332,418 @@ button.danger {
     white-space: pre-wrap;
     word-break: break-all;
 }
+
+/* Shared status, action, and focus states */
+a {
+    color: var(--accent);
+}
+
+a:focus-visible,
+button:focus-visible,
+input:focus-visible,
+textarea:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
+
+input:disabled,
+textarea:disabled,
+button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+button:disabled:hover {
+    opacity: 0.5;
+}
+
+.error-msg {
+    color: var(--red);
+}
+
+.success-msg {
+    color: var(--green);
+}
+
+.actions {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+}
+
+.actions a {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 2.1rem;
+    padding: 0.3rem 0.75rem;
+    border: 1px solid var(--accent);
+    border-radius: 4px;
+    background: var(--accent);
+    color: var(--bg);
+    font-size: 0.85rem;
+    font-weight: 500;
+    text-decoration: none;
+}
+
+.actions a:hover {
+    opacity: 0.9;
+}
+
+/* Workspace cards and action-required panels */
+.workspace-card {
+    flex-wrap: wrap;
+    align-items: center;
+}
+
+.workspace-card .alias {
+    flex: 1 1 10rem;
+    overflow-wrap: anywhere;
+}
+
+.workspace-card .stage {
+    flex: 1 1 12rem;
+    min-width: 10rem;
+    overflow-wrap: anywhere;
+}
+
+.workspace-card > .actions {
+    flex: 0 1 auto;
+    justify-content: flex-end;
+    min-width: min(100%, 12rem);
+    margin-left: auto;
+}
+
+.workspace-card > .action-status,
+.workspace-card > .error-msg {
+    flex: 1 0 100%;
+    min-width: 0;
+}
+
+.workspace-card .countdown {
+    color: var(--yellow);
+    font-size: 0.85rem;
+    white-space: nowrap;
+}
+
+.workspace-card .action-status,
+.host-trust-status {
+    color: var(--subtext);
+    font-size: 0.85rem;
+}
+
+.workspace-card .host-trust-panel,
+.workspace-card .authentication-error {
+    flex: 1 0 100%;
+    min-width: 0;
+    margin-top: 0.25rem;
+    padding: 1rem;
+    border: 1px solid var(--yellow);
+    border-radius: 6px;
+    background: var(--overlay);
+    color: var(--text);
+    font-size: 0.9rem;
+}
+
+.workspace-card .host-trust-panel.blocking-warning {
+    border-color: var(--red);
+}
+
+.host-trust-panel h3,
+.authentication-error h3 {
+    margin-bottom: 0.5rem;
+    color: var(--text);
+    font-size: 1rem;
+}
+
+.host-trust-panel p,
+.authentication-error p {
+    margin-top: 0.45rem;
+    line-height: 1.4;
+    overflow-wrap: anywhere;
+}
+
+.host-trust-panel .actions,
+.authentication-error .actions {
+    margin-top: 0.8rem;
+}
+
+.host-trust-panel .cancel-host-btn {
+    border-color: var(--border);
+    background: transparent;
+    color: var(--text);
+}
+
+.host-trust-panel.blocking-warning .replace-host-btn,
+.authentication-error .danger {
+    background: var(--red);
+    border-color: var(--red);
+    color: var(--bg);
+}
+
+/* Dashboard status is inserted immediately above the card list. */
+.dashboard-status {
+    min-height: 1.35rem;
+    margin: 0.25rem 0 0.5rem;
+    color: var(--subtext);
+    overflow-wrap: anywhere;
+}
+
+.dashboard-status:empty {
+    display: none;
+}
+
+/* Key upload form and fixed slots */
+#keys-section section + section {
+    margin-top: 1.5rem;
+}
+
+#keys-status {
+    min-height: 1.35rem;
+    margin: 0.25rem 0 0.5rem;
+    overflow-wrap: anywhere;
+}
+
+#upload-key-help {
+    max-width: 70rem;
+    margin-bottom: 0.75rem;
+    color: var(--subtext);
+    line-height: 1.45;
+}
+
+#key-upload-form {
+    display: flex;
+    align-items: flex-end;
+    flex-wrap: wrap;
+    gap: 1rem;
+    padding: 1rem;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--surface);
+}
+
+#key-upload-form .form-group {
+    flex: 1 1 13rem;
+    min-width: 13rem;
+    margin-bottom: 0;
+}
+
+#key-upload-form input[type="file"] {
+    width: 100%;
+    max-width: 100%;
+    padding: 0.35rem;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--overlay);
+    color: var(--text);
+}
+
+#key-upload-form button {
+    flex: 0 0 auto;
+}
+
+#keys-list {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 0.75rem;
+}
+
+#keys-list > li {
+    display: block;
+    min-width: 0;
+    min-height: 10rem;
+    margin-bottom: 0;
+    padding: 1rem;
+    border-radius: 8px;
+}
+
+#keys-list > li h4 {
+    margin-bottom: 0.75rem;
+    color: var(--accent);
+    font-size: 1rem;
+}
+
+#keys-list .key-slot-content {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    gap: 0.45rem;
+}
+
+#keys-list .key-slot-content > p {
+    line-height: 1.4;
+    overflow-wrap: anywhere;
+}
+
+#keys-list .key-slot-content .actions {
+    margin-top: 0.35rem;
+}
+
+#keys-list .key-name,
+#keys-list .key-algorithm,
+#keys-list .key-fingerprint {
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+#keys-list .key-name {
+    flex: none;
+    font-weight: 600;
+}
+
+#keys-list .key-algorithm,
+#keys-list .key-fingerprint {
+    color: var(--subtext);
+}
+
+#keys-list .key-fingerprint {
+    font-family: monospace;
+    font-size: 0.8rem;
+}
+
+#keys-list button {
+    font-size: 0.85rem;
+    padding: 0.3rem 0.65rem;
+}
+
+#keys-list .upload-slot {
+    background: transparent;
+    color: var(--accent);
+}
+
+.clipboard-fallback {
+    position: fixed;
+    width: 1px;
+    height: 1px;
+    opacity: 0;
+    pointer-events: none;
+}
+
+/* SSH configuration guidance, status, and best-effort diagnostics */
+#config-guidance {
+    margin-bottom: 1rem;
+    padding: 0.75rem 1rem;
+    border-left: 3px solid var(--accent);
+    background: var(--surface);
+    color: var(--subtext);
+    line-height: 1.5;
+    overflow-wrap: anywhere;
+}
+
+#config-guidance code {
+    color: var(--text);
+    font-family: monospace;
+}
+
+#config-editor {
+    margin-bottom: 1.5rem;
+}
+
+#config-editor > label {
+    color: var(--subtext);
+}
+
+#config-text {
+    display: block;
+    min-height: 20rem;
+    margin-top: 0.35rem;
+}
+
+#config-status {
+    min-height: 1.35rem;
+    margin: 0.5rem 0 0;
+    overflow-wrap: anywhere;
+}
+
+#config-errors {
+    margin: 0.5rem 0;
+}
+
+#config-errors:empty {
+    display: none;
+}
+
+#config-errors .error-msg {
+    display: block;
+    margin-top: 0.35rem;
+    padding: 0.55rem 0.75rem;
+    border-left: 3px solid var(--red);
+    background: var(--surface);
+    line-height: 1.4;
+    overflow-wrap: anywhere;
+}
+
+#save-config {
+    margin-top: 0.25rem;
+}
+
+#alias-list {
+    margin-top: 0.5rem;
+}
+
+#alias-list li {
+    overflow-wrap: anywhere;
+}
+
+@media (max-width: 760px) {
+    main {
+        padding: 1rem;
+    }
+
+    header {
+        flex-wrap: wrap;
+        align-items: flex-start;
+        gap: 0.65rem;
+    }
+
+    header nav {
+        order: 3;
+        flex-basis: 100%;
+        flex-wrap: wrap;
+        gap: 0.75rem;
+    }
+
+    #key-upload-form {
+        align-items: stretch;
+    }
+
+    #key-upload-form .form-group {
+        flex-basis: 100%;
+        min-width: 0;
+    }
+
+    #key-upload-form button {
+        width: 100%;
+    }
+
+    #keys-list {
+        grid-template-columns: 1fr;
+    }
+
+    .workspace-card {
+        align-items: flex-start;
+    }
+
+    .workspace-card .alias,
+    .workspace-card .stage,
+    .workspace-card > .clients,
+    .workspace-card > .countdown,
+    .workspace-card > .actions {
+        flex-basis: 100%;
+        min-width: 0;
+        margin-left: 0;
+    }
+
+    .workspace-card > .actions {
+        justify-content: flex-start;
+    }
+
+    .workspace-card .status {
+        align-self: flex-start;
+    }
+
+    #config-text {
+        min-height: 18rem;
+    }
+}

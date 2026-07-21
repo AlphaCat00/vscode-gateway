@@ -179,6 +179,12 @@ WS     /editor/{session_id}/{path}
 
 Key upload is multipart form data with `name` and `private_key`. Trust requests submit the exact pending `alias`, `host`, `port`, and `publicKey`, plus `replace` for a changed key.
 
+## Browser Frontend
+
+The checked-in frontend is server-rendered and uses fixed Ed25519, RSA, and ECDSA key slots with one generic multipart upload form. The dashboard renders host-trust actions on workspace cards and retries the existing session after Trust or Replace; Cancel uses the existing session Close action. A changed-host response contains only the currently presented fingerprint, so the card explains that the previous fingerprint is unavailable. If a challenge is explicitly marked as a jump host, the card describes it defensively as a jump host used by the selected alias; native `ProxyJump` behavior remains subject to the backend limitation below.
+
+The SSH config page shows backend-authoritative config errors and adds best-effort client-side line hints for prohibited directives by inspecting the submitted text. The backend does not provide line metadata. Browser automation is not part of the current coverage.
+
 ## Lifespan And Deployment
 
 Application lifespan acquires an exclusive process lock, opens and migrates SQLite, loads the SSH catalog, initializes services, runs recovery, and then reports ready. Timers and session workers belong to the lifespan task group. Shutdown rejects new work, closes sessions' local resources, drains tasks, closes shared HTTP resources and SQLite, and releases the process lock.
@@ -203,7 +209,6 @@ The same integration lifecycle can run against a real OpenVSCode release with th
 ## Current Limitations
 
 - Native `ProxyJump` does not yet enforce the exact key and trust policy used for target connections.
-- The checked-in key-management frontend still reflects the previous key API; the backend multipart upload and host-trust APIs are the current contract.
 - SSH config validation is a defensive directive scanner and alias extractor, not a complete parser.
 - Key files and SQLite metadata cannot be committed atomically across a crash.
 - Remote helper and archive staging currently use predictable shared `/tmp` locations or `/tmp` staging paths.

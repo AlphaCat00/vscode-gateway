@@ -11,6 +11,19 @@ uv run python scripts/create-password-hash.py
 uv run uvicorn vscode_gateway.app:create_app --factory --workers 1
 ```
 
+## Using the gateway
+
+- Workspaces come from literal SSH config `Host` aliases. Edit the config at
+  `/settings/ssh`.
+- Under `/settings/keys`, upload at most one unencrypted private key for each of
+  Ed25519, ECDSA, and RSA. The gateway tries all uploaded keys automatically. Do not
+  configure `IdentityFile` or `IdentityAgent`; `RemoteCommand` is supported.
+- Click **Open** on a workspace card to start it. Unknown or changed host keys
+  require explicit fingerprint verification on the card, followed by the
+  existing **Retry** flow.
+- If authentication fails, use the card links back to SSH Config and SSH Keys
+  to correct the connection settings or manage uploaded keys.
+
 ## Architecture
 
 One process, one origin, one SQLite file. Workspaces are SSH config `Host` aliases.
