@@ -1,3 +1,5 @@
+"""Manage remote editor session lifecycle and resources."""
+
 from __future__ import annotations
 
 import asyncio
@@ -7,9 +9,10 @@ from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, cast
 
 import aiosqlite
+import asyncssh
 import structlog
 
 from vscode_gateway.db import (
@@ -31,6 +34,7 @@ from vscode_gateway.db import (
     update_session_stage,
 )
 from vscode_gateway.errors import ErrorCode, GatewayError
+from vscode_gateway.host_trust import HostTrustService
 from vscode_gateway.models import (
     CloseReason,
     RecoveryReport,
@@ -44,27 +48,33 @@ from vscode_gateway.models import (
 from vscode_gateway.proxy import ProxyRegistry
 from vscode_gateway.runtime import RuntimeService
 from vscode_gateway.settings import Settings
-from vscode_gateway.ssh import SshCatalog, start_local_forward
+from vscode_gateway.ssh_config import SshCatalog
+from vscode_gateway.ssh_connection import SshConnection, SshConnectionService
+
+logger = structlog.get_logger()
+_RESOURCE_CLOSE_TIMEOUT = 5.0
 
 
 @dataclass
 class _OpenLedger:
-    """Operation-local resource ledger for one ``_do_open`` invocation.
-
-    Tracks each acquired resource so cancellation-safe and exception-safe
-    cleanup runs in reverse order of acquisition and never acts on
-    resources that were never created (Plan §14.1). Capacity lifetime is
-    governed separately by the HI-01 ledger keyed on session ID.
-    """
+    """Resources acquired during one open operation."""
 
     session_id: SessionId
     alias: str
+    ssh_conn: SshConnection | None = None
     remote_started: bool = False
     remote_identity_persisted: bool = False
-    tunnel_started: bool = False
+    forward_started: bool = False
     tunnel_identity_persisted: bool = False
     registry_added: bool = False
     ready_task: asyncio.Task[None] | None = None
+
+
+@dataclass
+class _SessionTunnel:
+    ssh_conn: SshConnection
+    listener: asyncssh.SSHListener | None = None
+    watcher_task: asyncio.Task[None] | None = None
 
 
 class SessionService:
@@ -75,22 +85,22 @@ class SessionService:
         catalog: SshCatalog,
         runtime: RuntimeService,
         proxy_registry: ProxyRegistry,
+        connection_service: SshConnectionService,
+        host_trust_service: HostTrustService,
     ) -> None:
         self._settings = settings
         self._db = db
         self._catalog = catalog
         self._runtime = runtime
         self._registry = proxy_registry
+        self._connection_service = connection_service
+        self._host_trust_service = host_trust_service
 
         self._alias_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
-        # Capacity ownership ledger keyed by session ID. Per Plan §14.6 the
-        # ledger is the source of truth for who owns a slot; an anonymous
-        # integer cannot be rolled back safely on failure or rebuilt from
-        # persisted rows during recovery.
         self._capacity_total: int = settings.session_capacity
         self._capacity_owned: set[SessionId] = set()
 
-        self._tunnel_processes: dict[SessionId, asyncio.subprocess.Process] = {}
+        self._tunnels: dict[SessionId, _SessionTunnel] = {}
         self._grace_timers: dict[SessionId, asyncio.Task[None]] = {}
         self._start_tasks: dict[SessionId, asyncio.Task[None]] = {}
         self._connected_counts: dict[SessionId, int] = defaultdict(int)
@@ -99,10 +109,39 @@ class SessionService:
     def bind_background(self, spawn_fn: Callable[[Awaitable[Any]], asyncio.Task[Any]]) -> None:
         self._spawn_fn = spawn_fn
 
+    async def shutdown(self) -> None:
+        """Close all local forwarding resources without stopping remotes.
+
+        Durable session rows remain intact so startup recovery can inspect
+        and reattach to the managed remote processes on the next start.
+        """
+        for task in list(self._grace_timers.values()):
+            task.cancel()
+        self._grace_timers.clear()
+
+        for session_id, tunnel in list(self._tunnels.items()):
+            self._registry.remove(session_id)
+            await self._cancel_forward_watcher(tunnel)
+            if tunnel.listener is not None:
+                error = await self._close_listener(tunnel.listener)
+                if error is not None:
+                    logger.warning(
+                        "shutdown_listener_close_failed",
+                        session_id=str(session_id),
+                        error=error,
+                    )
+            error = await self._close_connection(tunnel.ssh_conn.conn)
+            if error is not None:
+                logger.warning(
+                    "shutdown_connection_close_failed",
+                    session_id=str(session_id),
+                    error=error,
+                )
+        self._tunnels.clear()
+
     def _spawn(self, coro: Awaitable[Any]) -> asyncio.Task[Any] | None:
         if self._spawn_fn is not None:
             return self._spawn_fn(coro)
-        # Default: use the running loop and attach a logging done-callback.
         task = asyncio.ensure_future(coro)
 
         def _done(t: asyncio.Task[Any]) -> None:
@@ -115,7 +154,6 @@ class SessionService:
         task.add_done_callback(_done)
         return task
 
-    # --- Capacity ownership ledger (Plan §14.6) ---
     def _capacity_acquire(self, session_id: SessionId) -> None:
         if session_id in self._capacity_owned:
             structlog.get_logger().warning("capacity_acquire_duplicate", session_id=str(session_id))
@@ -167,9 +205,6 @@ class SessionService:
             )
             await insert_session(self._db, session)
 
-            # Reserve capacity for this specific session ID only after the
-            # row is durable. If acquisition fails (capacity was taken
-            # while we awaited insert), roll back the row.
             try:
                 self._capacity_acquire(session_id)
             except RuntimeError as exc:
@@ -181,16 +216,10 @@ class SessionService:
                     status_code=429,
                 ) from exc
 
-            # Spawn the slow _do_open work in the background so the HTTP
-            # route can return 202 immediately. _do_open is responsible for
-            # updating the session record (including marking it error) as it
-            # progresses.
             task = self._spawn(self._run_open(session_id, alias))
             if task is not None:
                 self._start_tasks[session_id] = task
             else:
-                # No background runner available — run inline (used in unit
-                # tests that don't bind a spawner).
                 try:
                     return await self._do_open(session_id, alias)
                 except Exception:
@@ -199,12 +228,6 @@ class SessionService:
             return self._to_view(session)
 
     async def _run_open(self, session_id: SessionId, alias: str) -> None:
-        # The task wrapper owns the single durable transition from an
-        # unexpected exception to a sanitized ``error`` row (Plan §14.1
-        # step 5). ``_do_open`` performs the bulk of the cleanup contract
-        # itself; this defensive layer exists so that a programming bug
-        # raised from inside ``_do_open`` (e.g. during cleanup) cannot
-        # leave a durable ``starting`` row.
         try:
             await self._do_open(session_id, alias)
         except asyncio.CancelledError:
@@ -232,13 +255,19 @@ class SessionService:
         ledger = _OpenLedger(session_id=session_id, alias=alias)
         try:
             await update_session_stage(self._db, str(session_id), SessionStage.VALIDATE)
-            capabilities = await self._runtime.capabilities(alias)
+            ssh_conn = await self._connection_service.connect_for_session(
+                session_id=session_id,
+                alias=alias,
+                role="target",
+            )
+            ledger.ssh_conn = ssh_conn
 
             await update_session_stage(self._db, str(session_id), SessionStage.INSTALL)
-            await self._runtime.ensure_installed(alias, capabilities.platform)
+            capabilities = await self._runtime.capabilities(ssh_conn.conn)
+            await self._runtime.ensure_installed(ssh_conn.conn, capabilities.platform)
 
             await update_session_stage(self._db, str(session_id), SessionStage.START_REMOTE)
-            remote = await self._runtime.start_session(alias, session_id)
+            remote = await self._runtime.start_session(ssh_conn.conn, session_id)
             ledger.remote_started = True
             await set_remote_identity(
                 self._db,
@@ -252,32 +281,31 @@ class SessionService:
             ledger.remote_identity_persisted = True
 
             await update_session_stage(self._db, str(session_id), SessionStage.START_TUNNEL)
-            tunnel_identity, tunnel_proc = await start_local_forward(
-                self._settings, alias, remote.port
+            listener, local_port = await self._connection_service.forward_local_port(
+                ssh_conn, remote.port
             )
-            ledger.tunnel_started = True
+            ledger.forward_started = True
             await asyncio.shield(
                 set_tunnel_identity(
                     self._db,
                     str(session_id),
-                    tunnel_identity.local_port,
-                    tunnel_identity.pid,
+                    local_port,
+                    0,  # no subprocess PID
                 )
             )
             ledger.tunnel_identity_persisted = True
-            self._tunnel_processes[session_id] = tunnel_proc
-            self._registry.add(session_id, tunnel_identity.local_port)
+            self._tunnels[session_id] = _SessionTunnel(
+                ssh_conn=ssh_conn,
+                listener=listener,
+            )
+            self._registry.add(session_id, local_port)
             ledger.registry_added = True
+            self._spawn_forward_watcher(session_id)
 
             await update_session_stage(self._db, str(session_id), SessionStage.VERIFY)
-            await self._verify_editor_health(session_id, tunnel_identity.local_port)
+            await self._verify_editor_health(session_id, local_port)
 
-            # The final readiness commit is shielded so a shutdown-induced
-            # cancellation arriving at the moment of completion cannot
-            # leave the row in ``starting`` while the resources are live.
-            # The shielded task is awaited via ``_await_ready_commit`` so
-            # cancellation cleanup can still observe the final outcome
-            # before deciding whether to preserve or tear down resources.
+            # Keep the durable state aligned with live resources on cancellation.
             ready_task = asyncio.ensure_future(mark_ready(self._db, str(session_id)))
             ledger.ready_task = ready_task
             await asyncio.shield(ready_task)
@@ -301,6 +329,49 @@ class SessionService:
             )
             raise
 
+    def _spawn_forward_watcher(self, session_id: SessionId) -> None:
+        tunnel = self._tunnels.get(session_id)
+        if tunnel is None or tunnel.listener is None:
+            return
+        if tunnel.watcher_task is not None:
+            return
+
+        async def _watch() -> None:
+            try:
+                await tunnel.listener.wait_closed()  # type: ignore[union-attr]
+            except asyncio.CancelledError:
+                return
+            await self.on_tunnel_exit(session_id, 0)
+
+        task = self._spawn(_watch())
+        if task is not None:
+            tunnel.watcher_task = cast(asyncio.Task[None], task)
+
+    async def _cancel_forward_watcher(self, tunnel: _SessionTunnel) -> None:
+        task = tunnel.watcher_task
+        if task is None or task is asyncio.current_task():
+            return
+        task.cancel()
+        with suppress(asyncio.CancelledError, Exception):
+            await task
+        tunnel.watcher_task = None
+
+    async def _close_listener(self, listener: asyncssh.SSHListener) -> str | None:
+        try:
+            listener.close()
+            await asyncio.wait_for(listener.wait_closed(), timeout=_RESOURCE_CLOSE_TIMEOUT)
+        except Exception as exc:
+            return f"Forward listener close error: {exc}"
+        return None
+
+    async def _close_connection(self, conn: asyncssh.SSHClientConnection) -> str | None:
+        try:
+            conn.close()
+            await asyncio.wait_for(conn.wait_closed(), timeout=_RESOURCE_CLOSE_TIMEOUT)
+        except Exception as exc:
+            return f"SSH connection close error: {exc}"
+        return None
+
     async def _finalize_open_read(
         self,
         session_id: SessionId,
@@ -320,11 +391,6 @@ class SessionService:
         code: ErrorCode,
         message: str,
     ) -> None:
-        # If the mark_ready commit was already in flight, the shielded
-        # transaction will complete regardless of cancellation. Wait for
-        # that outcome so cleanup does not race the final commit: if the
-        # row is now ``ready`` the resources are live and must be
-        # preserved for close()/retry() to reclaim (Plan §14.1 step 4).
         ready_task = ledger.ready_task
         if ready_task is not None:
             with suppress(asyncio.CancelledError, Exception):
@@ -332,43 +398,35 @@ class SessionService:
                     await ready_task
             existing = await get_session(self._db, str(ledger.session_id))
             if existing is not None and existing.state == SessionState.READY:
-                # The session transitioned to ready despite cancellation;
-                # resources and capacity must remain owned by this row.
                 return
 
-        # Reverse-order cleanup relative to acquisition: registry, tunnel,
-        # then remote. Best-effort only; each step swallows further errors
-        # so a single failure cannot prevent subsequent steps.
         if ledger.registry_added:
             with suppress(Exception):
                 self._registry.remove(ledger.session_id)
             ledger.registry_added = False
 
-        tunnel = self._tunnel_processes.pop(ledger.session_id, None)
+        tunnel = self._tunnels.pop(ledger.session_id, None)
         if tunnel is not None:
-            ledger.tunnel_started = False
-            tunnel_terminated_ok = True
-            with suppress(Exception):
-                tunnel.terminate()
-                try:
-                    await asyncio.wait_for(tunnel.wait(), timeout=5.0)
-                except TimeoutError:
-                    tunnel.kill()
-                    with suppress(Exception):
-                        await tunnel.wait()
-            structlog.get_logger().info(
-                "open_cleanup_tunnel_stopped",
-                session_id=str(ledger.session_id),
-            )
-            if tunnel_terminated_ok and ledger.tunnel_identity_persisted:
+            await self._cancel_forward_watcher(tunnel)
+            listener_error = None
+            if tunnel.listener is not None:
+                listener_error = await self._close_listener(tunnel.listener)
+            if listener_error is None:
+                ledger.forward_started = False
                 with suppress(Exception):
                     await asyncio.shield(clear_tunnel_identity(self._db, str(ledger.session_id)))
                 ledger.tunnel_identity_persisted = False
+            else:
+                logger.warning(
+                    "open_cleanup_listener_close_failed",
+                    session_id=str(ledger.session_id),
+                    error=listener_error,
+                )
 
-        if ledger.remote_started:
+        if ledger.remote_started and ledger.ssh_conn is not None:
             remote_stopped_ok = True
             try:
-                await self._runtime.stop_session(ledger.alias, ledger.session_id)
+                await self._runtime.stop_session(ledger.ssh_conn.conn, ledger.session_id)
             except Exception:
                 remote_stopped_ok = False
             ledger.remote_started = False
@@ -376,12 +434,22 @@ class SessionService:
                 with suppress(Exception):
                     await asyncio.shield(clear_remote_identity(self._db, str(ledger.session_id)))
                 ledger.remote_identity_persisted = False
+                ledger.remote_started = False
 
-        # Preserve durable evidence: mark the row ``error`` with a
-        # sanitized code/message. Capacity remains owned by this session
-        # ID because the error row is resource-bearing and stays until
-        # close()/retry() deletes it and calls ``_capacity_release``
-        # exactly once (Plan §14.6).
+        if ledger.ssh_conn is not None:
+            close_error = await self._close_connection(ledger.ssh_conn.conn)
+            if close_error is not None:
+                logger.warning(
+                    "open_cleanup_connection_close_failed",
+                    session_id=str(ledger.session_id),
+                    error=close_error,
+                )
+                self._tunnels[ledger.session_id] = _SessionTunnel(
+                    ssh_conn=ledger.ssh_conn,
+                    listener=tunnel.listener if tunnel is not None else None,
+                )
+            ledger.ssh_conn = None
+
         with suppress(Exception):
             existing = await get_session(self._db, str(ledger.session_id))
             if existing is not None and existing.state != SessionState.READY:
@@ -410,12 +478,7 @@ class SessionService:
             self._cancel_grace(session_id)
             self._registry.remove(session_id)
 
-            # Cancel and *await* the start task before deciding what to
-            # clean up (Plan §14.2 step 3, HI-03). The start task runs
-            # without the alias lock, so awaiting it inside the lock is
-            # safe; its cancellation cleanup contract completes so the
-            # row's persisted identity reflects whatever resources the
-            # operation actually acquired.
+            # Settle an in-flight open before inspecting its resources.
             start_task = self._start_tasks.pop(session_id, None)
             if start_task is not None:
                 start_task.cancel()
@@ -424,80 +487,103 @@ class SessionService:
 
             close_session = session
 
-        # Slow cleanup runs in the background; route returns 202.
         self._spawn(self._do_close(close_session))
 
     async def _do_close(self, session: SessionRecord) -> None:
         session_id = session.id
 
-        # Re-read the row by session id at the start of cleanup. Decisions
-        # must use the current persisted identity/state, not the stale
-        # snapshot captured before the start task settled (HI-03,
-        # Plan §14.2 step 4). The start task has either finished its own
-        # cleanup (clearing identity) or never persisted any; in both
-        # cases the fresh snapshot is authoritative.
         fresh = await get_session(self._db, str(session_id))
         if fresh is None:
-            # Row already gone: whoever deleted it owns capacity release.
             self._capacity_release(session_id)
             self._connected_counts.pop(session_id, None)
             return
 
         errors: list[str] = []
+        remote_absent = False
+        connection_close_failed = False
 
-        tunnel = self._tunnel_processes.pop(session_id, None)
+        tunnel = self._tunnels.pop(session_id, None)
+        ssh_conn: SshConnection | None = tunnel.ssh_conn if tunnel is not None else None
         if tunnel is not None:
-            try:
-                tunnel.terminate()
-                try:
-                    await asyncio.wait_for(tunnel.wait(), timeout=10.0)
-                except TimeoutError:
-                    tunnel.kill()
-                    await tunnel.wait()
-            except ProcessLookupError:
-                pass
-            except Exception as exc:
-                errors.append(f"Tunnel termination error: {exc}")
+            await self._cancel_forward_watcher(tunnel)
+            if tunnel.listener is not None:
+                listener_error = await self._close_listener(tunnel.listener)
+                if listener_error is not None:
+                    errors.append(listener_error)
+                else:
+                    with suppress(Exception):
+                        await clear_tunnel_identity(self._db, str(session_id))
 
-        # Stop the remote managed session by session id whenever identity
-        # is persisted, regardless of the pre-close state. HI-03: do not
-        # skip remote inspection solely because an earlier snapshot had no
-        # PID; the fresh snapshot determines absence (Plan §14.2 step 6).
-        if fresh.remote_pid:
-            try:
-                await self._runtime.stop_session(fresh.alias, session_id)
-            except GatewayError as exc:
-                errors.append(exc.safe_message)
-            except Exception as exc:
-                errors.append(str(exc))
+        try:
+            ssh_conn = await self._conn_for_remote(
+                session_id=session_id,
+                alias=fresh.alias,
+                ssh_conn=ssh_conn,
+            )
+            if fresh.remote_pid is not None:
+                await self._runtime.stop_session(ssh_conn.conn, session_id)
+                remote_absent = True
+            else:
+                inspection = await self._runtime.inspect_session(ssh_conn.conn, session_id)
+                if inspection["running"] is True:
+                    await self._runtime.stop_session(ssh_conn.conn, session_id)
+                remote_absent = True
 
-        if errors:
+            await self._runtime.remove_session(ssh_conn.conn, session_id)
+        except GatewayError as exc:
+            errors.append(exc.safe_message)
+        except Exception as exc:
+            errors.append(str(exc))
+        finally:
+            if ssh_conn is not None:
+                close_error = await self._close_connection(ssh_conn.conn)
+                if close_error is not None:
+                    errors.append(close_error)
+                    connection_close_failed = True
+
+        if connection_close_failed and ssh_conn is not None:
+            self._tunnels[session_id] = _SessionTunnel(
+                ssh_conn=ssh_conn,
+                listener=None,
+            )
+
+        if remote_absent:
+            try:
+                await clear_remote_identity(self._db, str(session_id))
+            except Exception as exc:
+                errors.append(f"Failed to clear remote identity: {exc}")
+
+        if errors or not remote_absent:
+            message = "; ".join(errors) if errors else "Remote process absence was not confirmed"
             await mark_error(
                 self._db,
                 str(session_id),
                 ErrorCode.STOP_FAILED.value,
-                "; ".join(errors),
+                message,
                 stage=SessionStage.STOP,
             )
-            # Row retained as error/stop_failed; capacity stays owned
-            # (Plan §14.6).
             return
 
-        with suppress(Exception):
-            await self._runtime.remove_session(fresh.alias, session_id)
-
         await delete_session(self._db, str(session_id))
-        # Release this session's capacity reservation only after the row is
-        # gone and resources are confirmed absent (Plan §14.2 step 9).
         self._capacity_release(session_id)
 
         self._connected_counts.pop(session_id, None)
 
+    async def _conn_for_remote(
+        self,
+        *,
+        session_id: SessionId,
+        alias: str,
+        ssh_conn: SshConnection | None,
+    ) -> SshConnection:
+        """Reuse the session connection or open a new owned connection."""
+        if ssh_conn is not None:
+            return ssh_conn
+        return await self._connection_service.connect_for_session(
+            session_id=session_id, alias=alias, role="target"
+        )
+
     async def retry(self, alias: str) -> SessionView:
-        # Per plan §14.3: retry must never call public ``open()`` while
-        # holding the same non-reentrant alias lock. We synchronously
-        # establish cleanup safety inside the lock, release it, then call
-        # the public ``open()`` from outside.
         async with self._get_lock(alias):
             session = await get_session_by_alias(self._db, alias)
             if session is None:
@@ -513,10 +599,6 @@ class SessionService:
                     status_code=409,
                 )
 
-            # Cancel and *await* any residual start task so its cancellation
-            # cleanup contract completes before we touch resources. Never
-            # spawn a competing background close that could overlap with a
-            # new open.
             start_task = self._start_tasks.pop(session.id, None)
             if start_task is not None:
                 start_task.cancel()
@@ -526,10 +608,6 @@ class SessionService:
             self._cancel_grace(session.id)
             self._registry.remove(session.id)
 
-            # Run resource cleanup synchronously. ``_do_close`` is
-            # responsible for stopping owned tunnel/remote, deleting the
-            # row, and releasing capacity exactly once. If cleanup cannot
-            # prove absence it leaves the error row in place and re-raises.
             try:
                 await self._do_close(session)
             except Exception as exc:
@@ -538,18 +616,18 @@ class SessionService:
                     f"Retry aborted: cleanup failed: {exc}",
                     status_code=500,
                 ) from exc
+            if await get_session(self._db, str(session.id)) is not None:
+                raise GatewayError(
+                    ErrorCode.STOP_FAILED,
+                    "Retry aborted: cleanup could not confirm remote process absence",
+                    status_code=409,
+                )
 
-        # Old run safely closed; lock released. Open the fresh run through
-        # the public entry point so we never re-enter the alias lock.
         return await self.open(alias)
 
     async def recover_all(self) -> RecoveryReport:
         sessions = await list_sessions(self._db)
 
-        # Rebuild the capacity ownership ledger from persisted rows before
-        # accepting mutations so recovery matches Plan §14.6: every
-        # resource-bearing row (all durable rows here) counts against
-        # capacity. Deletes during recovery remove the corresponding id.
         self._capacity_owned = {record.id for record in sessions}
 
         recovered = 0
@@ -558,99 +636,146 @@ class SessionService:
 
         for record in sessions:
             async with self._get_lock(record.alias):
+                ssh_conn: SshConnection | None = None
+                listener: asyncssh.SSHListener | None = None
+                keep_resources = False
                 try:
-                    if record.state == SessionState.STARTING:
-                        insp = await self._runtime.inspect_session(record.alias, record.id)
-                        if insp.get("running") and insp.get("identity_ok", False):
-                            port = insp.get("port", 0)
-                            if port:
-                                tunnel_identity, tunnel_proc = await start_local_forward(
-                                    self._settings, record.alias, port
-                                )
-                                await set_tunnel_identity(
-                                    self._db,
-                                    str(record.id),
-                                    tunnel_identity.local_port,
-                                    tunnel_identity.pid,
-                                )
-                                self._tunnel_processes[record.id] = tunnel_proc
-                                self._registry.add(record.id, tunnel_identity.local_port)
-                                await mark_ready(self._db, str(record.id))
-                                recovered += 1
-                            else:
+                    if record.state in (SessionState.STARTING, SessionState.READY):
+                        ssh_conn = await self._connection_service.connect_for_session(
+                            session_id=record.id, alias=record.alias, role="target"
+                        )
+                        insp = await self._runtime.inspect_session(ssh_conn.conn, record.id)
+                        if insp["running"] is False:
+                            if record.state == SessionState.STARTING:
+                                await self._runtime.remove_session(ssh_conn.conn, record.id)
+                                close_error = await self._close_connection(ssh_conn.conn)
+                                if close_error is not None:
+                                    raise GatewayError(
+                                        ErrorCode.RECOVERY_FAILED,
+                                        close_error,
+                                        status_code=500,
+                                    )
+                                ssh_conn = None
                                 await delete_session(self._db, str(record.id))
                                 cleaned += 1
                                 self._capacity_release(record.id)
-                        else:
-                            await mark_error(
-                                self._db,
-                                str(record.id),
-                                ErrorCode.RECOVERY_FAILED.value,
-                                "Remote process not found or identity mismatch",
-                            )
-                            failed += 1
-
-                    elif record.state == SessionState.READY:
-                        insp = await self._runtime.inspect_session(record.alias, record.id)
-                        if insp.get("running") and insp.get("identity_ok", False):
-                            port = insp.get("port", 0)
-                            if port:
-                                tunnel_identity, tunnel_proc = await start_local_forward(
-                                    self._settings, record.alias, port
-                                )
-                                await set_tunnel_identity(
+                            else:
+                                await clear_remote_identity(self._db, str(record.id))
+                                await mark_error(
                                     self._db,
                                     str(record.id),
-                                    tunnel_identity.local_port,
-                                    tunnel_identity.pid,
+                                    ErrorCode.RECOVERY_FAILED.value,
+                                    "Remote process absent after restart",
                                 )
-                                self._tunnel_processes[record.id] = tunnel_proc
-                                self._registry.add(record.id, tunnel_identity.local_port)
-                            recovered += 1
-                        else:
+                                failed += 1
+                            continue
+
+                        port = insp.get("port")
+                        invalid_identity = not insp.get("identity_ok", False)
+                        invalid_port = not isinstance(port, int) or port <= 0
+                        if invalid_identity or invalid_port:
                             await mark_error(
                                 self._db,
                                 str(record.id),
                                 ErrorCode.RECOVERY_FAILED.value,
-                                "Remote process absent after restart",
+                                "Remote process identity mismatch or invalid port",
                             )
                             failed += 1
+                            continue
+
+                        remote_port = cast(int, port)
+                        listener, local_port = await self._connection_service.forward_local_port(
+                            ssh_conn, remote_port
+                        )
+                        await set_tunnel_identity(
+                            self._db,
+                            str(record.id),
+                            local_port,
+                            0,
+                        )
+                        if record.state == SessionState.STARTING:
+                            await mark_ready(self._db, str(record.id))
+
+                        self._tunnels[record.id] = _SessionTunnel(
+                            ssh_conn=ssh_conn,
+                            listener=listener,
+                        )
+                        self._registry.add(record.id, local_port)
+                        self._spawn_forward_watcher(record.id)
+                        keep_resources = True
+                        recovered += 1
 
                         if record.disconnect_deadline_at:
                             deadline = record.disconnect_deadline_at
                             if deadline > datetime.now(UTC):
-                                t = asyncio.ensure_future(self._grace_watcher(record.id, deadline))
-                                self._grace_timers[record.id] = t
+                                task = self._spawn(self._grace_watcher(record.id, deadline))
+                                if task is not None:
+                                    self._grace_timers[record.id] = cast(asyncio.Task[None], task)
                             else:
                                 self._spawn(
-                                    self.close(record.alias, CloseReason.DISCONNECT_GRACE_EXPIRED)
+                                    self.close(
+                                        record.alias,
+                                        CloseReason.DISCONNECT_GRACE_EXPIRED,
+                                    )
                                 )
 
                     elif record.state == SessionState.STOPPING:
-                        self._spawn(self._do_close(record))
+                        await self._do_close(record)
+                        if await get_session(self._db, str(record.id)) is None:
+                            cleaned += 1
+                        else:
+                            failed += 1
 
                     elif record.state == SessionState.ERROR:
-                        insp = await self._runtime.inspect_session(record.alias, record.id)
-                        if not insp.get("running"):
+                        ssh_conn = await self._connection_service.connect_for_session(
+                            session_id=record.id, alias=record.alias, role="target"
+                        )
+                        insp = await self._runtime.inspect_session(ssh_conn.conn, record.id)
+                        if insp["running"] is False:
+                            await self._runtime.remove_session(ssh_conn.conn, record.id)
+                            close_error = await self._close_connection(ssh_conn.conn)
+                            if close_error is not None:
+                                raise GatewayError(
+                                    ErrorCode.RECOVERY_FAILED,
+                                    close_error,
+                                    status_code=500,
+                                )
+                            ssh_conn = None
                             await delete_session(self._db, str(record.id))
                             cleaned += 1
                             self._capacity_release(record.id)
+                        else:
+                            failed += 1
 
-                except Exception:
-                    await mark_error(
-                        self._db,
-                        str(record.id),
-                        ErrorCode.RECOVERY_FAILED.value,
-                        "Recovery attempt failed",
+                except Exception as exc:
+                    if record.state != SessionState.ERROR:
+                        await mark_error(
+                            self._db,
+                            str(record.id),
+                            ErrorCode.RECOVERY_FAILED.value,
+                            "Recovery attempt failed",
+                        )
+                    logger.warning(
+                        "session_recovery_failed",
+                        session_id=str(record.id),
+                        alias=record.alias,
+                        error=str(exc),
                     )
                     failed += 1
+                finally:
+                    if not keep_resources:
+                        if listener is not None:
+                            await self._close_listener(listener)
+                            with suppress(Exception):
+                                await clear_tunnel_identity(self._db, str(record.id))
+                        if ssh_conn is not None:
+                            close_error = await self._close_connection(ssh_conn.conn)
+                            if close_error is not None:
+                                self._tunnels[record.id] = _SessionTunnel(
+                                    ssh_conn=ssh_conn,
+                                    listener=None,
+                                )
 
-        # Compute unresolved counts for the readiness gate (Plan §15.4):
-        # * error_sessions_remaining — durable rows still in ``error``
-        #   after recovery, awaiting operator close/retry.
-        # * orphaned_resources_remaining — error rows whose remote
-        #   process identity is still persisted, i.e. a remote process
-        #   we could not safely prove absent.
         remaining_after = await list_sessions(self._db)
         error_sessions_remaining = sum(1 for r in remaining_after if r.state == SessionState.ERROR)
         orphaned_resources_remaining = sum(
@@ -676,14 +801,15 @@ class SessionService:
             if record.alias not in catalog.aliases:
                 task_group.create_task(self.close(record.alias, CloseReason.ALIAS_REMOVED))
 
-    def get_workspaces(self) -> list[WorkspaceView]:
-        return []  # populated by routes calling get_workspaces_full
-
     async def get_workspaces_full(self) -> list[WorkspaceView]:
         catalog = self._catalog.snapshot
         catalog_aliases: set[str] = set(catalog.aliases) if catalog else set()
         sessions = await list_sessions(self._db)
         session_by_alias: dict[str, SessionRecord] = {s.alias: s for s in sessions}
+
+        challenges: dict[SessionId, Any] = {}
+        for ch in await self._host_trust_service.list_challenges():
+            challenges[ch.session_id] = ch
 
         result: list[WorkspaceView] = []
 
@@ -731,6 +857,7 @@ class SessionService:
                         ),
                         can_retry=session.state == SessionState.ERROR,
                         catalog_missing=alias not in catalog_aliases,
+                        ssh_host_key=challenges.get(session.id),
                     )
                 )
 
@@ -743,15 +870,23 @@ class SessionService:
 
     async def get_sessions(self) -> list[SessionView]:
         sessions = await list_sessions(self._db)
-        return [self._to_view(s) for s in sessions]
+        challenges: dict[SessionId, Any] = {}
+        for ch in await self._host_trust_service.list_challenges():
+            challenges[ch.session_id] = ch
+        return [self._to_view(s, challenges.get(s.id)) for s in sessions]
 
     async def get_session_view(self, alias: str) -> SessionView | None:
         session = await get_session_by_alias(self._db, alias)
         if session is None:
             return None
-        return self._to_view(session)
+        challenge: Any = await self._host_trust_service.get_challenge(session.id)
+        return self._to_view(session, challenge)
 
-    def _to_view(self, record: SessionRecord) -> SessionView:
+    def _to_view(
+        self,
+        record: SessionRecord,
+        ssh_host_key: Any | None = None,
+    ) -> SessionView:
         editor_url = None
         if record.state == SessionState.READY:
             editor_url = f"/editor/{record.id}/"
@@ -765,6 +900,7 @@ class SessionService:
             editor_url=editor_url,
             error_code=record.error_code,
             error_message=record.error_message,
+            ssh_host_key=ssh_host_key,
         )
 
     async def _verify_editor_health(self, session_id: SessionId, local_port: int) -> None:
@@ -847,5 +983,15 @@ class SessionService:
             ErrorCode.TUNNEL_LOST.value,
             f"SSH tunnel exited with code {return_code}",
         )
-        with suppress(Exception):
-            await self._runtime.stop_session(record.alias, session_id)
+        tunnel = self._tunnels.pop(session_id, None)
+        ssh_conn = tunnel.ssh_conn if tunnel is not None else None
+        if ssh_conn is not None:
+            with suppress(Exception):
+                await self._runtime.stop_session(ssh_conn.conn, session_id)
+            close_error = await self._close_connection(ssh_conn.conn)
+            if close_error is not None:
+                logger.warning(
+                    "tunnel_exit_connection_close_failed",
+                    session_id=str(session_id),
+                    error=close_error,
+                )

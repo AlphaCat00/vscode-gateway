@@ -4,6 +4,7 @@ import os
 import secrets
 from contextlib import suppress
 from pathlib import Path
+from typing import Any, cast
 
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -27,15 +28,16 @@ class Settings(BaseSettings):
     state_dir: Path = Field(default=Path("state"))
     runtime_dir: Path = Field(default=Path("runtime"))
 
-    ssh_config_path: Path = Field(default=Path("config/ssh_config"))
-    ssh_keys_dir: Path = Field(default=Path("config/keys"))
+    # Gateway-owned SSH state.
+    ssh_dir: Path = Field(default=Path("state/ssh"))
+    ssh_config_path: Path = Field(default=Path("state/ssh/config"))
+    ssh_known_hosts_path: Path = Field(default=Path("state/ssh/known_hosts"))
+    ssh_keys_dir: Path = Field(default=Path("state/ssh/keys"))
+
+    ssh_key_upload_max_bytes: int = Field(default=131_072, ge=256, le=1_048_576)
 
     password_hash_path: Path = Field(default=Path("state/password.hash"))
     session_secret_path: Path = Field(default=Path("state/session.secret"))
-
-    ssh_executable: str = Field(default="ssh")
-    scp_executable: str = Field(default="scp")
-    ssh_keygen_executable: str = Field(default="ssh-keygen")
 
     openvscode_version: str = Field(default="1.89.1")
     openvscode_linux_x64_url: str = Field(
@@ -81,24 +83,52 @@ class Settings(BaseSettings):
     log_level: str = Field(default="INFO")
     log_format: str = Field(default="json")
 
+    @model_validator(mode="before")
+    @classmethod
+    def _derive_ssh_paths(cls, data: object) -> object:
+        if not isinstance(data, dict):
+            return data
+
+        values = dict(cast(dict[str, Any], data))
+        state_dir = Path(values.get("state_dir", Path("state")))
+        ssh_dir = Path(values.get("ssh_dir", state_dir / "ssh"))
+        values.setdefault("ssh_dir", ssh_dir)
+        values.setdefault("ssh_config_path", ssh_dir / "config")
+        values.setdefault("ssh_known_hosts_path", ssh_dir / "known_hosts")
+        values.setdefault("ssh_keys_dir", ssh_dir / "keys")
+        return values
+
     @model_validator(mode="after")
     def _ensure_state_dirs(self) -> Settings:
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
+
+        self.ssh_dir.mkdir(parents=True, exist_ok=True)
+        with suppress(OSError):
+            os.chmod(self.ssh_dir, 0o700)
+
         self.ssh_keys_dir.mkdir(parents=True, exist_ok=True)
+        with suppress(OSError):
+            os.chmod(self.ssh_keys_dir, 0o700)
+
         self.ssh_config_path.parent.mkdir(parents=True, exist_ok=True)
         self.ssh_config_path.touch(exist_ok=True)
+        with suppress(OSError):
+            os.chmod(self.ssh_config_path, 0o600)
+
+        self.ssh_known_hosts_path.parent.mkdir(parents=True, exist_ok=True)
+        self.ssh_known_hosts_path.touch(exist_ok=True)
+        with suppress(OSError):
+            os.chmod(self.ssh_known_hosts_path, 0o600)
+
         return self
 
     @property
     def session_secret(self) -> str:
         """Hex-encoded SessionMiddleware signing secret.
 
-        The secret is stored on disk as a hex string so the file can be
-        inspected and edited without the lossy text decoding that random
-        bytes would require (HI-05, Plan §17.2). ``bytes.fromhex`` is the
-        only parser used; malformed or short material fails loudly at
-        startup rather than silently weakening the signer.
+        The secret is stored as hex to avoid lossy text decoding. Invalid
+        or short material fails startup instead of weakening the signer.
         """
         return self.session_secret_hex
 
@@ -120,16 +150,14 @@ class Settings(BaseSettings):
                 os.chmod(path, 0o600)
             return hex_text
         if not text:
-            msg = f"Session secret at {path} is empty; regenerate the file (HI-05)."
+            msg = f"Session secret at {path} is empty; regenerate the file."
             raise ValueError(msg)
         try:
             raw = bytes.fromhex(text)
         except ValueError as exc:
-            msg = f"Session secret at {path} is not valid hex; regenerate the file (HI-05)."
+            msg = f"Session secret at {path} is not valid hex; regenerate the file."
             raise ValueError(msg) from exc
         if len(raw) < 32:
-            msg = (
-                f"Session secret at {path} is {len(raw)} bytes; minimum 32 bytes required (HI-05)."
-            )
+            msg = f"Session secret at {path} is {len(raw)} bytes; minimum 32 bytes required."
             raise ValueError(msg)
         return text

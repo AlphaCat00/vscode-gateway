@@ -1,27 +1,4 @@
-"""Process-singleton file lock (HI-07 correction).
-
-Per Plan §6.1 the gateway must run exactly one ASGI process against a
-state directory. Alias locks, capacity ownership, tunnels, registry,
-presence, and grace timers are process-local; a second worker sharing
-SQLite while holding its own in-memory state breaks the architecture's
-core invariants. The documented ``uvicorn ... --workers 1`` command is
-advisory, so this module enforces the singleton invariant with an
-exclusive operating-system file lock acquired **before** any mutable
-service (DB, sessions, http client) is opened.
-
-The lock is acquired non-blocking (``LOCK_EX | LOCK_NB``); a second
-process gets ``BlockingIOError`` immediately and fails fast. The file
-descriptor is held for the entire process lifetime and the OS releases
-the lock automatically on process exit. ``release()`` is provided for
-clean teardown in tests and an explicit shutdown sequence.
-
-Security: the lock file path must not be a symlink. ``open(2)`` is
-called with ``O_NOFOLLOW`` so a symlink last-step replacement is also
-rejected at the syscall level. The state directory must exist as a
-directory; minimal existence + writability is required to acquire the
-lock. Full filesystem-mode and ownership enforcement overlaps with
-ME-01 and is intentionally not duplicated here.
-"""
+"""Process-wide file lock enforcing the single-worker deployment model."""
 
 from __future__ import annotations
 
@@ -48,10 +25,10 @@ def _errno_name(exc: OSError) -> str:
 
 def _validate_state_dir(state_dir: Path) -> None:
     if not state_dir.exists():
-        msg = f"State directory {state_dir!s} does not exist; refusing to start (HI-07)."
+        msg = f"State directory {state_dir!s} does not exist; refusing to start."
         raise LockAcquisitionError(msg)
     if not state_dir.is_dir():
-        msg = f"State directory {state_dir!s} is not a directory; refusing to start (HI-07)."
+        msg = f"State directory {state_dir!s} is not a directory; refusing to start."
         raise LockAcquisitionError(msg)
 
 
@@ -92,7 +69,7 @@ class ProcessLock:
                 "singleton_lock_symlink_rejected",
                 lock_file=str(self._lock_path),
             )
-            msg = f"Lock file path {self._lock_path!s} is a symlink; refusing to start (HI-07)."
+            msg = f"Lock file path {self._lock_path!s} is a symlink; refusing to start."
             raise LockAcquisitionError(msg)
         flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW
         try:
@@ -103,10 +80,7 @@ class ProcessLock:
                 lock_file=str(self._lock_path),
                 error=_errno_name(exc),
             )
-            msg = (
-                f"Failed to open singleton lock file {self._lock_path!s}: "
-                f"{_errno_name(exc)} (HI-07)."
-            )
+            msg = f"Failed to open singleton lock file {self._lock_path!s}: {_errno_name(exc)}."
             raise LockAcquisitionError(msg) from exc
         try:
             try:
@@ -119,7 +93,7 @@ class ProcessLock:
                 )
                 msg = (
                     "Another gateway process holds the singleton lock at "
-                    f"{self._lock_path!s}; refuse to start (HI-07)."
+                    f"{self._lock_path!s}; refuse to start."
                 )
                 raise LockAcquisitionError(msg) from exc
             except OSError as exc:
@@ -129,8 +103,7 @@ class ProcessLock:
                     error=_errno_name(exc),
                 )
                 msg = (
-                    f"Failed to acquire singleton lock at {self._lock_path!s}: "
-                    f"{_errno_name(exc)} (HI-07)."
+                    f"Failed to acquire singleton lock at {self._lock_path!s}: {_errno_name(exc)}."
                 )
                 raise LockAcquisitionError(msg) from exc
         except BaseException:
@@ -183,6 +156,6 @@ def check_multi_worker_env() -> None:
             )
             msg = (
                 f"Environment variable {var}={value} requests multiple workers; "
-                "the gateway is a single-process service (HI-07, Plan §6.1)."
+                "the gateway is a single-process service."
             )
             raise LockAcquisitionError(msg)

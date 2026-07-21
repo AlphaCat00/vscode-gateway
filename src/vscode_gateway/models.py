@@ -11,6 +11,10 @@ from pydantic import BaseModel, Field
 SshAlias = str
 SessionId = uuid.UUID
 
+SshKeyType = Literal["ed25519", "rsa", "ecdsa"]
+SSH_KEY_TYPES: tuple[SshKeyType, ...] = ("ed25519", "rsa", "ecdsa")
+SSH_KEY_LOAD_ORDER: tuple[SshKeyType, ...] = ("ed25519", "ecdsa", "rsa")
+
 
 class SessionState(StrEnum):
     STARTING = "starting"
@@ -54,19 +58,27 @@ class RuntimeCapabilities:
     available: bool
 
 
-@dataclass
-class TunnelIdentity:
-    local_port: int
-    pid: int
+@dataclass(frozen=True)
+class SshKeyMetadata:
+    type: SshKeyType
+    name: str
+    algorithm: str
+    fingerprint: str
 
 
-@dataclass
-class ProcessResult:
-    exit_code: int
-    stdout: bytes
-    stderr: bytes
-    duration: float
-    timed_out: bool
+HostKeyRole = Literal["target", "jump"]
+
+
+@dataclass(frozen=True)
+class HostKeyChallenge:
+    session_id: SessionId
+    role: HostKeyRole
+    alias: SshAlias
+    host: str
+    port: int
+    algorithm: str
+    fingerprint: str
+    public_key: str
 
 
 @dataclass
@@ -94,6 +106,8 @@ class SessionRecord:
     error_message: str | None = None
     close_reason: str | None = None
 
+    ssh_host_key: HostKeyChallenge | None = None
+
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
@@ -113,6 +127,7 @@ class WorkspaceView:
     can_close: bool = False
     can_retry: bool = False
     catalog_missing: bool = False
+    ssh_host_key: HostKeyChallenge | None = None
 
 
 @dataclass(frozen=True)
@@ -134,6 +149,7 @@ class SessionView:
     editor_url: str | None = None
     error_code: str | None = None
     error_message: str | None = None
+    ssh_host_key: HostKeyChallenge | None = None
 
 
 # Pydantic request/response models
@@ -151,11 +167,23 @@ class SshConfigUpdateRequest(BaseModel):
     expected_revision: str | None = Field(default=None, alias="expectedRevision")
 
 
-class SshKeyResponse(BaseModel):
+class KeyUploadResponse(BaseModel):
     name: str
+    type: SshKeyType
     algorithm: str
+    fingerprint: str
+    publicKey: str  # noqa: N815 - API field name
+
+
+class SshKeySlot(BaseModel):
+    present: bool
+    name: str | None = None
+    algorithm: str | None = None
     fingerprint: str | None = None
-    created_at: str | None = None
+
+
+class SshKeyInventory(BaseModel):
+    keys: dict[SshKeyType, SshKeySlot]
 
 
 class OpenCloseResponse(BaseModel):
@@ -194,3 +222,11 @@ class RecoveryReport(BaseModel):
     total: int
     error_sessions_remaining: int = 0
     orphaned_resources_remaining: int = 0
+
+
+class TrustHostKeyRequest(BaseModel):
+    alias: str
+    host: str
+    port: int = Field(ge=1, le=65535)
+    publicKey: str  # noqa: N815 - API field name
+    replace: bool = False

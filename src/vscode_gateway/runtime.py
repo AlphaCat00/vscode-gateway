@@ -1,3 +1,5 @@
+"""Manage the remote OpenVSCode runtime over an AsyncSSH connection."""
+
 from __future__ import annotations
 
 import hashlib
@@ -6,16 +8,13 @@ import uuid
 from pathlib import Path
 from typing import Any, cast
 
+import asyncssh
 import httpx
 
 from vscode_gateway.errors import ErrorCode, GatewayError
 from vscode_gateway.models import RuntimeCapabilities, RuntimeIdentity
 from vscode_gateway.settings import Settings
-from vscode_gateway.ssh import (
-    probe_capabilities,
-    run_process,
-    scp_transfer,
-)
+from vscode_gateway.ssh_connection import SshConnectionService
 
 HELPER_PATH = "/tmp/gateway-helper-v1.sh"
 
@@ -25,13 +24,26 @@ def _helper_path() -> str:
     return str(src.resolve())
 
 
-def _parse_json_dict(raw: bytes, *, default: dict[str, Any] | None = None) -> dict[str, Any]:
+def _parse_json_dict(
+    raw: bytes | str | None, *, default: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """Parse JSON bytes into a dict, returning ``default`` (or {}) on missing/invalid input."""
     fallback = default if default is not None else {}
-    if not raw:
+    if raw is None:
         return fallback
+    if isinstance(raw, bytes):
+        if not raw:
+            return fallback
+        try:
+            text = raw.decode("utf-8", errors="replace")
+        except UnicodeDecodeError:
+            return fallback
+    else:
+        text = raw
+        if not text:
+            return fallback
     try:
-        parsed = json.loads(raw)
+        parsed = json.loads(text)
     except json.JSONDecodeError:
         return fallback
     if isinstance(parsed, dict):
@@ -39,47 +51,46 @@ def _parse_json_dict(raw: bytes, *, default: dict[str, Any] | None = None) -> di
     return fallback
 
 
-async def ensure_helper_installed(settings: Settings, alias: str) -> None:
+def _check_run_result(result: asyncssh.SSHCompletedProcess, *, code: ErrorCode, what: str) -> None:
+    if result.exit_status is None or result.exit_status != 0:
+        stderr = (result.stderr or b"")[:500]
+        raise GatewayError(
+            code,
+            f"{what}: {stderr!r}",
+            status_code=502,
+        )
+
+
+async def ensure_helper_installed(settings: Settings, conn: asyncssh.SSHClientConnection) -> None:
     local = _helper_path()
-    result = await scp_transfer(settings, alias, Path(local), HELPER_PATH)
-    if result.exit_code != 0:
-        raise GatewayError(
-            ErrorCode.SSH_UNREACHABLE,
-            f"Failed to upload helper: {result.stderr[:500]!r}",
-            status_code=502,
-        )
-    await run_process(
-        [
-            settings.ssh_executable,
-            "-F",
-            str(settings.ssh_config_path),
-            "--",
-            alias,
-            "chmod",
-            "+x",
-            HELPER_PATH,
-        ],
-        timeout=settings.subprocess_timeout,
-    )
-
-
-async def get_capabilities(settings: Settings, alias: str) -> RuntimeCapabilities:
-    await ensure_helper_installed(settings, alias)
-    result = await probe_capabilities(settings, alias, HELPER_PATH)
-    if result.exit_code != 0:
-        raise GatewayError(
-            ErrorCode.SSH_UNREACHABLE,
-            f"SSH probe failed: {result.stderr[:500]!r}",
-            status_code=502,
-        )
     try:
-        data = _parse_json_dict(result.stdout)
-    except json.JSONDecodeError as exc:
+        await SshConnectionService.sftp_put(conn, local, HELPER_PATH)
+    except asyncssh.SFTPError as exc:
         raise GatewayError(
-            ErrorCode.REMOTE_UNSUPPORTED,
-            f"Invalid helper response: {result.stdout[:200]!r}",
+            ErrorCode.SSH_UNREACHABLE,
+            f"Failed to upload helper: {exc}",
             status_code=502,
         ) from exc
+
+    result = await SshConnectionService.run_command(
+        conn,
+        ["chmod", "+x", HELPER_PATH],
+        timeout=settings.subprocess_timeout,
+    )
+    _check_run_result(result, code=ErrorCode.SSH_UNREACHABLE, what="Failed to chmod helper")
+
+
+async def get_capabilities(
+    settings: Settings, conn: asyncssh.SSHClientConnection
+) -> RuntimeCapabilities:
+    await ensure_helper_installed(settings, conn)
+    result = await SshConnectionService.run_command(
+        conn,
+        ["/bin/sh", HELPER_PATH, "capabilities"],
+        timeout=settings.subprocess_timeout,
+    )
+    _check_run_result(result, code=ErrorCode.SSH_UNREACHABLE, what="SSH probe failed")
+    data = _parse_json_dict(result.stdout)
 
     if not data.get("available"):
         raise GatewayError(
@@ -98,12 +109,10 @@ async def get_capabilities(settings: Settings, alias: str) -> RuntimeCapabilitie
 
 async def ensure_installed(
     settings: Settings,
-    alias: str,
+    conn: asyncssh.SSHClientConnection,
     platform: str,
 ) -> None:
-    await ensure_helper_installed(settings, alias)
-
-    arch = (await get_capabilities(settings, alias)).arch if platform == "linux" else "unknown"
+    arch = (await get_capabilities(settings, conn)).arch if platform == "linux" else "unknown"
 
     if arch == "aarch64":
         url = settings.openvscode_linux_arm64_url
@@ -119,45 +128,32 @@ async def ensure_installed(
             status_code=500,
         )
 
-    result = await run_process(
-        [
-            settings.ssh_executable,
-            "-F",
-            str(settings.ssh_config_path),
-            "--",
-            alias,
-            "/bin/sh",
-            HELPER_PATH,
-            "runtime-inspect",
-            sha256,
-            settings.openvscode_version,
-        ],
+    result = await SshConnectionService.run_command(
+        conn,
+        ["/bin/sh", HELPER_PATH, "runtime-inspect", sha256, settings.openvscode_version],
         timeout=settings.subprocess_timeout,
     )
+    _check_run_result(result, code=ErrorCode.REMOTE_UNSUPPORTED, what="runtime-inspect failed")
 
     data = _parse_json_dict(result.stdout)
-
     if data.get("installed"):
         return
 
     local_archive = await _download_and_verify(settings, url, sha256)
 
     remote_tmp = f"/tmp/ovs-{uuid.uuid4().hex[:12]}.tar.gz"
-    result = await scp_transfer(settings, alias, local_archive, remote_tmp)
-    if result.exit_code != 0:
+    try:
+        await SshConnectionService.sftp_put(conn, str(local_archive), remote_tmp)
+    except asyncssh.SFTPError as exc:
         raise GatewayError(
             ErrorCode.RUNTIME_INSTALL_FAILED,
-            f"Failed to upload runtime: {result.stderr[:500]!r}",
+            f"Failed to upload runtime: {exc}",
             status_code=502,
-        )
+        ) from exc
 
-    result = await run_process(
+    result = await SshConnectionService.run_command(
+        conn,
         [
-            settings.ssh_executable,
-            "-F",
-            str(settings.ssh_config_path),
-            "--",
-            alias,
             "/bin/sh",
             HELPER_PATH,
             "runtime-install",
@@ -167,16 +163,13 @@ async def ensure_installed(
         ],
         timeout=settings.subprocess_timeout * 2,
     )
-
-    if result.exit_code != 0:
+    if result.exit_status is None or result.exit_status != 0:
         raise GatewayError(
             ErrorCode.RUNTIME_INSTALL_FAILED,
-            f"Remote install failed: {result.stderr[:500]!r}",
+            f"Remote install failed: {(result.stderr or b'')[:500]!r}",
             status_code=502,
         )
-
     data = _parse_json_dict(result.stdout)
-
     if not data.get("installed"):
         raise GatewayError(
             ErrorCode.RUNTIME_INSTALL_FAILED,
@@ -223,40 +216,22 @@ async def _download_and_verify(settings: Settings, url: str, expected_sha256: st
 
 async def start_session(
     settings: Settings,
-    alias: str,
+    conn: asyncssh.SSHClientConnection,
     session_id: uuid.UUID,
 ) -> RuntimeIdentity:
-    result = await run_process(
-        [
-            settings.ssh_executable,
-            "-F",
-            str(settings.ssh_config_path),
-            "--",
-            alias,
-            "/bin/sh",
-            HELPER_PATH,
-            "session-start",
-            str(session_id),
-        ],
+    result = await SshConnectionService.run_command(
+        conn,
+        ["/bin/sh", HELPER_PATH, "session-start", str(session_id)],
         timeout=settings.startup_timeout,
     )
-
-    if result.exit_code != 0:
+    if result.exit_status is None or result.exit_status != 0:
         raise GatewayError(
             ErrorCode.REMOTE_START_FAILED,
-            f"Remote start failed: {result.stderr[:500]!r}",
+            f"Remote start failed: {(result.stderr or b'')[:500]!r}",
             status_code=502,
         )
 
-    try:
-        data = _parse_json_dict(result.stdout)
-    except json.JSONDecodeError as exc:
-        raise GatewayError(
-            ErrorCode.REMOTE_START_FAILED,
-            f"Invalid start response: {result.stdout[:200]!r}",
-            status_code=502,
-        ) from exc
-
+    data = _parse_json_dict(result.stdout)
     if "error" in data:
         raise GatewayError(
             ErrorCode.REMOTE_START_FAILED,
@@ -276,101 +251,102 @@ async def start_session(
 
 async def inspect_session(
     settings: Settings,
-    alias: str,
+    conn: asyncssh.SSHClientConnection,
     session_id: uuid.UUID,
 ) -> dict[str, Any]:
-    result = await run_process(
-        [
-            settings.ssh_executable,
-            "-F",
-            str(settings.ssh_config_path),
-            "--",
-            alias,
-            "/bin/sh",
-            HELPER_PATH,
-            "session-inspect",
-            str(session_id),
-        ],
+    # Inspection is also used after reconnecting during retry and recovery,
+    # when the helper may never have been uploaded or may have been lost from /tmp.
+    await ensure_helper_installed(settings, conn)
+    result = await SshConnectionService.run_command(
+        conn,
+        ["/bin/sh", HELPER_PATH, "session-inspect", str(session_id)],
         timeout=settings.subprocess_timeout,
     )
-
+    _check_run_result(
+        result,
+        code=ErrorCode.RECOVERY_FAILED,
+        what="Remote session inspection failed",
+    )
     data = _parse_json_dict(result.stdout)
-    if not data:
-        return {"error": "invalid_response"}
+    if "error" in data:
+        raise GatewayError(
+            ErrorCode.RECOVERY_FAILED,
+            str(data.get("detail", data["error"])),
+            status_code=502,
+        )
+    if not isinstance(data.get("running"), bool):
+        raise GatewayError(
+            ErrorCode.RECOVERY_FAILED,
+            "Remote session inspection returned an invalid response",
+            status_code=502,
+        )
     return data
 
 
 async def stop_session(
     settings: Settings,
-    alias: str,
+    conn: asyncssh.SSHClientConnection,
     session_id: uuid.UUID,
 ) -> bool:
-    result = await run_process(
-        [
-            settings.ssh_executable,
-            "-F",
-            str(settings.ssh_config_path),
-            "--",
-            alias,
-            "/bin/sh",
-            HELPER_PATH,
-            "session-stop",
-            str(session_id),
-        ],
+    result = await SshConnectionService.run_command(
+        conn,
+        ["/bin/sh", HELPER_PATH, "session-stop", str(session_id)],
         timeout=settings.stop_timeout,
     )
-
+    _check_run_result(result, code=ErrorCode.STOP_FAILED, what="Remote session stop failed")
     data = _parse_json_dict(result.stdout)
-
     if "error" in data:
         raise GatewayError(
             ErrorCode.STOP_FAILED,
             str(data.get("detail", data["error"])),
             status_code=502,
         )
-
-    return bool(data.get("stopped", False))
+    if data.get("stopped") is not True:
+        raise GatewayError(
+            ErrorCode.STOP_FAILED,
+            "Remote session stop did not confirm process absence",
+            status_code=502,
+        )
+    return True
 
 
 async def remove_session(
     settings: Settings,
-    alias: str,
+    conn: asyncssh.SSHClientConnection,
     session_id: uuid.UUID,
-) -> None:
-    await run_process(
-        [
-            settings.ssh_executable,
-            "-F",
-            str(settings.ssh_config_path),
-            "--",
-            alias,
-            "/bin/sh",
-            HELPER_PATH,
-            "session-remove",
-            str(session_id),
-        ],
+) -> bool:
+    result = await SshConnectionService.run_command(
+        conn,
+        ["/bin/sh", HELPER_PATH, "session-remove", str(session_id)],
         timeout=settings.subprocess_timeout,
     )
+    _check_run_result(result, code=ErrorCode.STOP_FAILED, what="Remote session removal failed")
+    data = _parse_json_dict(result.stdout)
+    if "error" in data:
+        raise GatewayError(
+            ErrorCode.STOP_FAILED,
+            str(data.get("detail", data["error"])),
+            status_code=502,
+        )
+    if data.get("removed") is not True:
+        raise GatewayError(
+            ErrorCode.STOP_FAILED,
+            "Remote session removal was not confirmed",
+            status_code=502,
+        )
+    return True
 
 
 async def list_sessions(
     settings: Settings,
-    alias: str,
+    conn: asyncssh.SSHClientConnection,
 ) -> list[str]:
-    result = await run_process(
-        [
-            settings.ssh_executable,
-            "-F",
-            str(settings.ssh_config_path),
-            "--",
-            alias,
-            "/bin/sh",
-            HELPER_PATH,
-            "session-list",
-        ],
+    result = await SshConnectionService.run_command(
+        conn,
+        ["/bin/sh", HELPER_PATH, "session-list"],
         timeout=settings.subprocess_timeout,
     )
-
+    _check_run_result(result, code=ErrorCode.RECOVERY_FAILED, what="Remote session list failed")
     data = _parse_json_dict(result.stdout)
     sessions = data.get("sessions", [])
     if isinstance(sessions, list):
@@ -379,26 +355,37 @@ async def list_sessions(
 
 
 class RuntimeService:
+    """Orchestrates the remote helper script via a passed-in AsyncSSH connection."""
+
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
 
-    async def capabilities(self, alias: str) -> RuntimeCapabilities:
-        return await get_capabilities(self.settings, alias)
+    async def capabilities(self, conn: asyncssh.SSHClientConnection) -> RuntimeCapabilities:
+        return await get_capabilities(self.settings, conn)
 
-    async def ensure_installed(self, alias: str, platform: str) -> None:
-        await ensure_installed(self.settings, alias, platform)
+    async def ensure_installed(self, conn: asyncssh.SSHClientConnection, platform: str) -> None:
+        await ensure_installed(self.settings, conn, platform)
 
-    async def start_session(self, alias: str, session_id: uuid.UUID) -> RuntimeIdentity:
-        return await start_session(self.settings, alias, session_id)
+    async def start_session(
+        self, conn: asyncssh.SSHClientConnection, session_id: uuid.UUID
+    ) -> RuntimeIdentity:
+        return await start_session(self.settings, conn, session_id)
 
-    async def inspect_session(self, alias: str, session_id: uuid.UUID) -> dict[str, Any]:
-        return await inspect_session(self.settings, alias, session_id)
+    async def inspect_session(
+        self, conn: asyncssh.SSHClientConnection, session_id: uuid.UUID
+    ) -> dict[str, Any]:
+        return await inspect_session(self.settings, conn, session_id)
 
-    async def stop_session(self, alias: str, session_id: uuid.UUID) -> bool:
-        return await stop_session(self.settings, alias, session_id)
+    async def stop_session(self, conn: asyncssh.SSHClientConnection, session_id: uuid.UUID) -> bool:
+        return await stop_session(self.settings, conn, session_id)
 
-    async def remove_session(self, alias: str, session_id: uuid.UUID) -> None:
-        await remove_session(self.settings, alias, session_id)
+    async def remove_session(
+        self, conn: asyncssh.SSHClientConnection, session_id: uuid.UUID
+    ) -> bool:
+        return await remove_session(self.settings, conn, session_id)
 
-    async def list_sessions(self, alias: str) -> list[str]:
-        return await list_sessions(self.settings, alias)
+    async def list_sessions(self, conn: asyncssh.SSHClientConnection) -> list[str]:
+        return await list_sessions(self.settings, conn)
+
+
+__all__ = ["RuntimeService"]

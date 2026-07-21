@@ -1,4 +1,4 @@
-"""Unit tests for bidirectional HTTP proxy streaming (HI-06)."""
+"""Unit tests for bidirectional HTTP proxy streaming."""
 
 # pyright: reportPrivateUsage=false
 
@@ -215,8 +215,10 @@ def test_app_lifespan_builds_trust_env_false_client(tmp_path: Path) -> None:
     settings_kwargs: dict[str, Any] = {
         "state_dir": tmp_path / "state",
         "runtime_dir": tmp_path / "runtime",
-        "ssh_config_path": tmp_path / "ssh_config",
-        "ssh_keys_dir": tmp_path / "keys",
+        "ssh_dir": tmp_path / "ssh",
+        "ssh_config_path": tmp_path / "ssh" / "config",
+        "ssh_known_hosts_path": tmp_path / "ssh" / "known_hosts",
+        "ssh_keys_dir": tmp_path / "ssh" / "keys",
         "password_hash_path": tmp_path / "state" / "password.hash",
         "session_secret_path": tmp_path / "state" / "session.secret",
     }

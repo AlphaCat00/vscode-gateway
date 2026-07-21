@@ -1,9 +1,4 @@
-"""HI-05 regression tests.
-
-Covers the corrections from review finding HI-05: lossless secret
-loading, single middleware-owned session cookie, generation-based
-invalidation, login throttling, and CSRF-protected logout.
-"""
+"""Authentication, session, throttling, and CSRF regression tests."""
 
 from __future__ import annotations
 
@@ -45,8 +40,10 @@ def settings(tmp_path: Path) -> Settings:
     s = Settings(
         state_dir=state_dir,
         runtime_dir=tmp_path / "runtime",
-        ssh_config_path=tmp_path / "ssh_config",
-        ssh_keys_dir=tmp_path / "keys",
+        ssh_dir=tmp_path / "ssh",
+        ssh_config_path=tmp_path / "ssh" / "config",
+        ssh_known_hosts_path=tmp_path / "ssh" / "known_hosts",
+        ssh_keys_dir=tmp_path / "ssh" / "keys",
         password_hash_path=state_dir / "password.hash",
         session_secret_path=state_dir / "session.secret",
         secure_cookies=False,
@@ -59,8 +56,7 @@ def settings(tmp_path: Path) -> Settings:
 
 
 def _build_test_app(settings: Settings, throttle: LoginThrottle | None = None) -> FastAPI:
-    """A trimmed app mirroring the real login/logout/auth flow so HI-05
-    behavior can be exercised without the full lifespan recovery."""
+    """Build the login/logout flow without lifespan recovery."""
     if throttle is None:
         throttle = LoginThrottle(
             max_attempts=settings.login_max_attempts,
@@ -180,8 +176,10 @@ def test_bad_secret_raises_at_startup(tmp_path: Path) -> None:
     s = Settings(
         state_dir=state_dir,
         runtime_dir=tmp_path / "runtime",
-        ssh_config_path=tmp_path / "ssh_config",
-        ssh_keys_dir=tmp_path / "keys",
+        ssh_dir=tmp_path / "ssh",
+        ssh_config_path=tmp_path / "ssh" / "config",
+        ssh_known_hosts_path=tmp_path / "ssh" / "known_hosts",
+        ssh_keys_dir=tmp_path / "ssh" / "keys",
         password_hash_path=state_dir / "password.hash",
         session_secret_path=secret_path,
     )
@@ -197,8 +195,10 @@ def test_short_secret_raises(tmp_path: Path) -> None:
     s = Settings(
         state_dir=state_dir,
         runtime_dir=tmp_path / "runtime",
-        ssh_config_path=tmp_path / "ssh_config",
-        ssh_keys_dir=tmp_path / "keys",
+        ssh_dir=tmp_path / "ssh",
+        ssh_config_path=tmp_path / "ssh" / "config",
+        ssh_known_hosts_path=tmp_path / "ssh" / "known_hosts",
+        ssh_keys_dir=tmp_path / "ssh" / "keys",
         password_hash_path=state_dir / "password.hash",
         session_secret_path=secret_path,
     )
@@ -215,8 +215,10 @@ def test_secret_roundtrips_hex_losslessly(tmp_path: Path) -> None:
     s = Settings(
         state_dir=state_dir,
         runtime_dir=tmp_path / "runtime",
-        ssh_config_path=tmp_path / "ssh_config",
-        ssh_keys_dir=tmp_path / "keys",
+        ssh_dir=tmp_path / "ssh",
+        ssh_config_path=tmp_path / "ssh" / "config",
+        ssh_known_hosts_path=tmp_path / "ssh" / "known_hosts",
+        ssh_keys_dir=tmp_path / "ssh" / "keys",
         password_hash_path=state_dir / "password.hash",
         session_secret_path=secret_path,
     )

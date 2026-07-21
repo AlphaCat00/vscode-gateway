@@ -1,16 +1,4 @@
-"""Application readiness state (HI-04 correction).
-
-Per Plan §10.3 and §15 the gateway must not advertise ready until
-migrations, catalog initialization, capacity reconstruction, and
-mandatory startup recovery reach a safe result. §15.4 requires the
-readiness body to report unresolved counts (error-state sessions and
-orphaned remote processes that could not be cleaned).
-
-This module owns the single-process readiness state. Access is
-async-safe via an ``asyncio.Lock`` even though the deployment model is
-single-worker; reads use a non-locking snapshot so request handlers
-never block on readiness transitions.
-"""
+"""Application readiness state and unresolved resource counts."""
 
 from __future__ import annotations
 
@@ -75,8 +63,6 @@ class Readiness:
         return self._state.phase == ReadinessPhase.READY
 
     def snapshot(self) -> ReadinessState:
-        # Frozen dataclass + single asyncio task graph → safe to read
-        # without the lock. Avoids holding the lock across request paths.
         return self._state
 
     async def begin_recovery(self) -> None:

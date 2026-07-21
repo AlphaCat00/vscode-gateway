@@ -1,0 +1,212 @@
+# OpenVSCode SSH Gateway Design
+
+## Purpose
+
+The gateway exposes OpenVSCode Server instances running on SSH hosts through one authenticated web origin. A workspace is an explicit `Host` alias in a gateway-owned SSH config. Opening a workspace starts or recovers one remote editor process, creates an SSH local forward, and publishes the editor below `/editor/{session_id}/`.
+
+The implementation is intentionally a single Python process with one SQLite database. It has no external queue, worker, or frontend build pipeline.
+
+## Runtime Shape
+
+- Python 3.13+, FastAPI/Starlette, Uvicorn with exactly one worker
+- AsyncSSH for SSH connections, commands, SFTP, host-key verification, and forwarding
+- SQLite through aiosqlite with explicit SQL and `PRAGMA user_version` migrations
+- httpx for upstream HTTP and `websockets` for upstream WebSockets
+- Jinja2 templates and checked-in JavaScript/CSS
+- Argon2 single-user password authentication
+- structlog for structured logging
+
+The systemd service runs as `nobody`. This limits ambient user SSH configuration and credentials available to AsyncSSH, especially when it resolves native `ProxyJump` connections.
+
+## Local State
+
+The default paths are derived from `VSC_GATEWAY_STATE_DIR=state`:
+
+```text
+state/
+  gateway.db
+  gateway.lock
+  password.hash
+  session.secret
+  session.generation
+  ssh/
+    config
+    known_hosts
+    keys/
+      ed25519
+      ed25519.pub
+      ecdsa
+      ecdsa.pub
+      rsa
+      rsa.pub
+runtime/
+  openvscode-server-*.tar.gz
+```
+
+`ssh/` and `ssh/keys/` are mode `0700`; config, known-host, key, password, and secret files are mode `0600` where the platform permits it. SSH config, key pairs, and known-host updates use temporary files plus atomic replacement where applicable.
+
+SQLite contains:
+
+- `sessions`: durable session state, stages, remote process identity, proxy ports, presence, deadlines, and errors
+- `ssh_keys`: display metadata for the three key slots; private material remains on disk
+- `pending_host_keys`: the exact host-key challenge associated with a session
+
+## Authentication And Request Security
+
+The gateway has one password hash in `password.hash`. A signed session cookie authenticates browser requests. Login attempts are throttled in memory.
+
+All state-changing routes require authentication and a CSRF token. WebSocket upgrades require authentication and an exact `Origin` match with `canonical_origin`. Host validation, trusted proxy handling, secure-cookie settings, and maximum session age are configurable.
+
+API failures produced from `GatewayError` use `application/problem+json` and include a stable `code` plus a request ID.
+
+## SSH Configuration And Catalog
+
+`state/ssh/config` is the only workspace source. Literal aliases from `Host` declarations are published in the catalog; wildcard and negated patterns are not workspaces.
+
+Config writes:
+
+- require an optional SHA-256 revision for optimistic concurrency
+- reject NULs, oversized content, excessive lines, and excessive aliases
+- reject directives which can execute local programs, establish unmanaged forwards, or override gateway-owned identity and trust
+- atomically replace the config and refresh the in-memory catalog
+
+Alias discovery is deliberately lightweight. AsyncSSH remains the authority when it resolves a selected alias and applies supported SSH config directives.
+
+## Uploaded Keys
+
+The gateway accepts unencrypted OpenSSH private keys in three fixed algorithm slots:
+
+- `ed25519`
+- `ecdsa`
+- `rsa`
+
+There can be at most one key per slot. Uploads are classified from parsed key material rather than filenames, normalized, and stored with their public key. SQLite stores only the display name, algorithm, and SHA-256 fingerprint. Authentication tries present keys in deterministic order: Ed25519, ECDSA, then RSA.
+
+Uploads and deletions are serialized by an in-process lock. Replacing a key requires deleting the existing slot first. The current file-and-database update is not a cross-resource crash-atomic transaction.
+
+Target connections explicitly disable password, keyboard-interactive, host-based, GSSAPI, agent, and default-key authentication. At least one uploaded key is required.
+
+## Host Trust
+
+All target connections use `state/ssh/known_hosts`. Unknown or changed host keys are rejected, captured, and stored as a pending challenge containing the alias, host, port, algorithm, fingerprint, and full public key.
+
+The session enters `error` with `ssh_host_unknown` or `ssh_host_changed`. A trust request must exactly match the pending challenge. Changed keys additionally require `replace=true`. Non-default ports use the OpenSSH `[host]:port` form.
+
+After trust is recorded, the client explicitly retries the session. Trust is never granted automatically.
+
+## SSH Connections
+
+`SshConnectionService` owns AsyncSSH transport operations. A session uses one target connection for remote commands, SFTP, and local forwarding. Remote command arguments are converted with `shlex.join()` and passed as one command string; no local shell or system `ssh`, `scp`, or `ssh-keygen` process is used.
+
+Native AsyncSSH `ProxyJump` behavior is retained. Jump-host connections are created internally by AsyncSSH and do not currently receive the gateway's explicit uploaded-key and known-host options. Running the service as `nobody` reduces, but does not eliminate, that difference. This is a known security boundary to address before treating jump-host behavior as equivalent to direct target connections.
+
+## Remote Runtime
+
+The gateway uploads `gateway-helper-v1.sh` to `/tmp/gateway-helper-v1.sh`. The helper manages state under `~/.vscode-gateway` and supports capability inspection, runtime inspection/installation, session start/status/stop, and cleanup.
+
+For a new session the gateway:
+
+1. Validates the alias and reserves per-alias and global capacity.
+2. Creates a durable `starting` row.
+3. Opens and verifies an AsyncSSH connection.
+4. Uploads and probes the helper.
+5. Downloads a pinned OpenVSCode archive locally if absent, verifies its SHA-256 hash, and uploads it with SFTP when the remote runtime is absent.
+6. Starts OpenVSCode folderless on remote loopback with `--without-connection-token`.
+7. Stores the remote PID, port, boot ID, process start ID, executable, and session directory.
+8. Creates an AsyncSSH local forward on gateway loopback.
+9. Verifies the proxied editor and changes the row to `ready`.
+
+Before signaling a process, the helper verifies the saved PID against boot ID, process start ID, and executable. Cleanup does not remove the durable row until remote absence has been confirmed.
+
+## Session Model
+
+There is at most one active session per alias. Durable states are:
+
+- `starting`
+- `ready`
+- `stopping`
+- `error`
+
+`closed` is represented by the absence of a row and is synthesized in workspace responses. Stages expose current work such as validation, installation, remote start, tunnel start, verification, recovery, and stop.
+
+Concurrency rules:
+
+- a per-alias `asyncio.Lock` serializes open, retry, and close
+- an in-memory ownership set enforces global session capacity
+- compare-and-set SQL updates protect expected state transitions
+- SQLite transactions are never held while waiting for SSH, network, or proxy work
+- owned connections, listeners, workers, watchers, and timers are closed or awaited during shutdown
+
+Startup recovery inspects durable sessions, reconnects to remote editors when identity remains valid, rebuilds local forwards, and restores disconnect timers. Sessions which cannot be recovered remain visible as errors until retry or successful cleanup.
+
+## Presence And Automatic Close
+
+Editor presence is the number of active proxied WebSockets, not HTTP requests. The first connection clears a disconnect deadline. When the final WebSocket closes, the service persists a grace deadline. Expiry triggers normal session close and cleanup.
+
+HTTP and WebSocket editor traffic is available only below `/editor/{session_id}/`. The browser never receives the remote editor port or a direct SSH endpoint.
+
+## HTTP Surface
+
+Primary routes are:
+
+```text
+GET    /login
+POST   /login
+POST   /logout
+GET    /
+
+GET    /api/sessions
+GET    /api/sessions/{alias}
+POST   /api/sessions/{alias}/open
+POST   /api/sessions/{alias}/close
+POST   /api/sessions/{alias}/retry
+
+GET    /api/ssh/config
+PUT    /api/ssh/config
+GET    /api/ssh/catalog
+GET    /api/ssh/keys
+POST   /api/ssh/keys
+GET    /api/ssh/keys/{type}/public
+DELETE /api/ssh/keys/{type}
+POST   /api/ssh/hosts/trust
+
+GET    /healthz
+GET    /readyz
+GET    /api/version
+*      /editor/{session_id}/{path}
+WS     /editor/{session_id}/{path}
+```
+
+Key upload is multipart form data with `name` and `private_key`. Trust requests submit the exact pending `alias`, `host`, `port`, and `publicKey`, plus `replace` for a changed key.
+
+## Lifespan And Deployment
+
+Application lifespan acquires an exclusive process lock, opens and migrates SQLite, loads the SSH catalog, initializes services, runs recovery, and then reports ready. Timers and session workers belong to the lifespan task group. Shutdown rejects new work, closes sessions' local resources, drains tasks, closes shared HTTP resources and SQLite, and releases the process lock.
+
+Run Uvicorn with one worker only. In-memory locks, connection ownership, capacity, presence, throttling, and task supervision make multi-worker deployment invalid.
+
+## Verification
+
+The required local checks are:
+
+```bash
+uv run ruff check .
+uv run ruff format --check .
+uv run pyright
+uv run pytest
+```
+
+Unit tests use fake AsyncSSH connections and service doubles. The API integration test launches an ephemeral OpenSSH `sshd` on localhost and exercises authentication, CSRF, SSH config publication, key upload, host trust, retry, real SSH negotiation, SFTP runtime installation, forwarding, HTTP proxying, close, and key deletion. Its default runtime archive contains a small synthetic editor so the normal suite remains fast and offline.
+
+The same integration lifecycle can run against a real OpenVSCode release with the `real_editor` marker. Set `VSC_GATEWAY_TEST_OPENVSCODE_ARCHIVE` to a local archive, or set both `VSC_GATEWAY_TEST_OPENVSCODE_URL` and `VSC_GATEWAY_TEST_OPENVSCODE_SHA256`. `VSC_GATEWAY_TEST_OPENVSCODE_VERSION` optionally controls the runtime version tag.
+
+## Current Limitations
+
+- Native `ProxyJump` does not yet enforce the exact key and trust policy used for target connections.
+- The checked-in key-management frontend still reflects the previous key API; the backend multipart upload and host-trust APIs are the current contract.
+- SSH config validation is a defensive directive scanner and alias extractor, not a complete parser.
+- Key files and SQLite metadata cannot be committed atomically across a crash.
+- Remote helper and archive staging currently use predictable shared `/tmp` locations or `/tmp` staging paths.
+- Remote command output and SFTP operations do not yet have one uniform bounded-output and timeout policy.
+- The local forwarding port is selected before AsyncSSH binds it, leaving a small allocation race.
+- Automated coverage does not currently include jump hosts, proxied WebSockets, or browser behavior. Real OpenVSCode coverage is opt-in rather than part of the offline default suite.

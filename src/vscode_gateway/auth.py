@@ -71,12 +71,7 @@ def is_authenticated(request: HTTPConnection) -> bool:
 
 
 def create_session(request: Request, settings: Settings) -> None:
-    """Authorize the request by mutating the middleware-owned session dict.
-
-    Only SessionMiddleware writes the ``gateway_session`` cookie; this
-    helper never emits a manual ``Set-Cookie`` with the same name (HI-05,
-    Plan §17.2).
-    """
+    """Authorize the middleware-owned session."""
     session = request.session
     session[AUTH_FLAG] = True
     session[ISSUED_AT] = datetime.now(UTC).isoformat()
@@ -85,21 +80,14 @@ def create_session(request: Request, settings: Settings) -> None:
 
 
 def clear_session(request: Request) -> None:
-    """Revoke the request session.
-
-    SessionMiddleware observes the cleared dict and removes the cookie
-    from the client; no second writer is used (HI-05, Plan §17.3).
-    """
+    """Revoke the request session."""
     request.session.clear()
 
 
 def current_session_generation(settings: Settings) -> int:
     """Return the server-side auth generation, initializing it on first use.
 
-    The generation lives next to the password hash in the state
-    directory. Rotating it (via ``bump_session_generation``) invalidates
-    every previously issued session because ``require_auth`` rejects any
-    signed session whose stored generation differs (HI-05, Plan §17.3).
+    Rotating the generation invalidates every previously issued session.
     """
     gen_file = settings.state_dir / "session.generation"
     try:
@@ -129,16 +117,7 @@ def session_generation_matches(request: Request, settings: Settings) -> bool:
 
 
 class LoginThrottle:
-    """Fixed-window login throttle keyed by client IP.
-
-    Tracks failure timestamps inside the configured window; once
-    ``max_attempts`` failures accumulate within the window, subsequent
-    attempts are rejected for ``lockout_seconds`` from the most recent
-    failure. State is in-memory and bounded by the window because
-    timestamps older than the window are discarded on every lookup
-    (HI-05, Plan §17.5). Not thread-safe; intended for asyncio
-    single-process use.
-    """
+    """In-memory fixed-window login throttle keyed by client IP."""
 
     def __init__(
         self,
@@ -182,14 +161,7 @@ class LoginThrottle:
 
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
-    """Add minimal security headers and a no-store policy on
-    authenticated responses (HI-05, Plan §17.6).
-
-    Basic browser hardening headers are emitted on every response.
-    ``Cache-Control: no-store, private`` is only added when the request
-    carries an authenticated session, to avoid forcing no-store on public
-    assets that benefit from caching.
-    """
+    """Add browser security headers and disable authenticated caching."""
 
     async def dispatch(
         self,

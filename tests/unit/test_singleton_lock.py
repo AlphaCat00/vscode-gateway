@@ -1,4 +1,4 @@
-"""Unit tests for HI-07: process-singleton lock enforcement."""
+"""Unit tests for process-singleton lock enforcement."""
 
 # pyright: reportPrivateUsage=false
 
@@ -28,8 +28,10 @@ def _settings(tmp_path: Path) -> Settings:
     return Settings(
         state_dir=tmp_path / "state",
         runtime_dir=tmp_path / "runtime",
-        ssh_config_path=tmp_path / "ssh_config",
-        ssh_keys_dir=tmp_path / "keys",
+        ssh_dir=tmp_path / "ssh",
+        ssh_config_path=tmp_path / "ssh" / "config",
+        ssh_known_hosts_path=tmp_path / "ssh" / "known_hosts",
+        ssh_keys_dir=tmp_path / "ssh" / "keys",
         password_hash_path=tmp_path / "state" / "password.hash",
         session_secret_path=tmp_path / "state" / "session.secret",
     )
@@ -82,7 +84,7 @@ def test_acquire_then_release_releases_to_second_lock(tmp_path: Path) -> None:
 def test_second_process_cannot_acquire_lock(tmp_path: Path) -> None:
     """Simulate a second process by holding a raw ``flock`` on the lock
     file from this test process; ``ProcessLock.acquire`` must fail fast
-    with ``LockAcquisitionError`` (HI-07)."""
+    with ``LockAcquisitionError``."""
     state_dir = tmp_path / "state"
     state_dir.mkdir()
     lock_path = state_dir / LOCK_FILE_NAME
@@ -167,7 +169,7 @@ def test_lifespan_second_invocation_fails_fast_when_lock_held(tmp_path: Path) ->
 
 def test_lifespan_reports_degraded_when_lock_already_held(tmp_path: Path) -> None:
     """If the lock is held by a peer before lifespan runs, the lifespan
-    must mark readiness degraded (HI-04 flow) and proceed to ``yield``
+    must mark readiness degraded and proceed to ``yield``
     so ``/readyz`` keeps reporting the failure."""
     state_dir = tmp_path / "state"
     state_dir.mkdir()
@@ -272,14 +274,16 @@ def test_create_app_refuses_second_instance_via_lifespan(
 ) -> None:
     """Two lifespans against the same state directory: the first holds
     the lock for its whole lifetime, the second must fail fast and mark
-    readiness degraded (HI-07, Plan §6.1 test requirement)."""
+    readiness degraded."""
     from vscode_gateway.app import create_app
 
     state_dir = tmp_path / "state"
     monkeypatch.setenv("VSC_GATEWAY_STATE_DIR", str(state_dir))
     monkeypatch.setenv("VSC_GATEWAY_RUNTIME_DIR", str(tmp_path / "runtime"))
-    monkeypatch.setenv("VSC_GATEWAY_SSH_CONFIG_PATH", str(tmp_path / "ssh_config"))
-    monkeypatch.setenv("VSC_GATEWAY_SSH_KEYS_DIR", str(tmp_path / "keys"))
+    monkeypatch.setenv("VSC_GATEWAY_SSH_DIR", str(tmp_path / "ssh"))
+    monkeypatch.setenv("VSC_GATEWAY_SSH_CONFIG_PATH", str(tmp_path / "ssh" / "config"))
+    monkeypatch.setenv("VSC_GATEWAY_SSH_KNOWN_HOSTS_PATH", str(tmp_path / "ssh" / "known_hosts"))
+    monkeypatch.setenv("VSC_GATEWAY_SSH_KEYS_DIR", str(tmp_path / "ssh" / "keys"))
     monkeypatch.setenv("VSC_GATEWAY_PASSWORD_HASH_PATH", str(state_dir / "pw.hash"))
     monkeypatch.setenv("VSC_GATEWAY_SESSION_SECRET_PATH", str(state_dir / "sess.secret"))
     monkeypatch.setenv("VSC_GATEWAY_SECURE_COOKIES", "false")

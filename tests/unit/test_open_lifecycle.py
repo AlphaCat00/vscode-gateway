@@ -1,4 +1,4 @@
-"""Unit tests for HI-02: cancellation-safe and exception-safe ``_do_open``.
+"""Cancellation-safe and exception-safe ``_do_open`` tests.
 
 These tests exercise the operation-local resource ledger, the reverse-order
 cleanup on failure, the sanitized ``internal_error`` row written by the
@@ -15,9 +15,10 @@ import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import aiosqlite
+import asyncssh
 import pytest
 
 from vscode_gateway import sessions as sessions_mod
@@ -31,29 +32,37 @@ from vscode_gateway.db import (
     mark_ready as db_mark_ready,
 )
 from vscode_gateway.errors import ErrorCode, GatewayError
+from vscode_gateway.host_trust import HostTrustService
 from vscode_gateway.models import (
     CatalogSnapshot,
+    HostKeyRole,
     RuntimeCapabilities,
     RuntimeIdentity,
     SessionId,
     SessionRecord,
     SessionStage,
     SessionState,
-    TunnelIdentity,
 )
 from vscode_gateway.proxy import ProxyRegistry
 from vscode_gateway.runtime import RuntimeService
 from vscode_gateway.sessions import SessionService
 from vscode_gateway.settings import Settings
-from vscode_gateway.ssh import SshCatalog
+from vscode_gateway.ssh_config import SshCatalog
+from vscode_gateway.ssh_connection import (
+    SshConnection,
+    SshConnectionService,
+    _HostKeyCapturer,
+)
 
 
 def _make_settings(tmp_path: Path, *, capacity: int = 10) -> Settings:
     return Settings(
         state_dir=tmp_path / "state",
         runtime_dir=tmp_path / "runtime",
-        ssh_config_path=tmp_path / "ssh_config",
-        ssh_keys_dir=tmp_path / "keys",
+        ssh_dir=tmp_path / "ssh",
+        ssh_config_path=tmp_path / "ssh" / "config",
+        ssh_known_hosts_path=tmp_path / "ssh" / "known_hosts",
+        ssh_keys_dir=tmp_path / "ssh" / "keys",
         password_hash_path=tmp_path / "state" / "password.hash",
         session_secret_path=tmp_path / "state" / "session.secret",
         session_capacity=capacity,
@@ -92,78 +101,130 @@ def runtime(settings: Settings) -> RuntimeService:
     return RuntimeService(settings)
 
 
+class _FakeConnectionHandle:
+    def __init__(self) -> None:
+        self.closed = False
+        self.waited = False
+
+    def close(self) -> None:
+        self.closed = True
+
+    async def wait_closed(self) -> None:
+        self.waited = True
+
+
+class _FakeListener:
+    def __init__(self) -> None:
+        self.closed = False
+        self.waited = False
+        self._closed = asyncio.Event()
+
+    def close(self) -> None:
+        self.closed = True
+        self._closed.set()
+
+    async def wait_closed(self) -> None:
+        await self._closed.wait()
+        self.waited = True
+
+
+class _FakeConnectionService(SshConnectionService):
+    def __init__(self) -> None:
+        self.connections: list[SshConnection] = []
+        self.listeners: list[_FakeListener] = []
+
+    async def connect_for_session(
+        self,
+        *,
+        session_id: SessionId,
+        alias: str,
+        role: HostKeyRole = "target",
+    ) -> SshConnection:
+        del session_id, role
+        handle = _FakeConnectionHandle()
+        connection = SshConnection(
+            conn=cast(asyncssh.SSHClientConnection, handle),
+            listener=None,
+            local_port=0,
+            remote_port=0,
+            alias=alias,
+            capturer=_HostKeyCapturer(),
+        )
+        self.connections.append(connection)
+        return connection
+
+    async def forward_local_port(
+        self,
+        ssh_conn: SshConnection,
+        remote_port: int,
+    ) -> tuple[asyncssh.SSHListener, int]:
+        listener = _FakeListener()
+        self.listeners.append(listener)
+        ssh_conn.listener = cast(asyncssh.SSHListener, listener)
+        ssh_conn.local_port = 54321
+        ssh_conn.remote_port = remote_port
+        return cast(asyncssh.SSHListener, listener), 54321
+
+
+@pytest.fixture
+def connection_service() -> _FakeConnectionService:
+    return _FakeConnectionService()
+
+
 @pytest.fixture
 def service(
     settings: Settings,
     db: aiosqlite.Connection,
     catalog: SshCatalog,
     runtime: RuntimeService,
+    connection_service: _FakeConnectionService,
 ) -> SessionService:
-    return SessionService(settings, db, catalog, runtime, ProxyRegistry())
-
-
-class _FakeTunnelProc:
-    """Minimal asyncio subprocess shim for the tunnel handle."""
-
-    def __init__(self) -> None:
-        self.returncode: int | None = None
-        self.terminated: bool = False
-        self.killed: bool = False
-        self._waiters: list[asyncio.Future[int]] = []
-
-    def terminate(self) -> None:
-        self.terminated = True
-        self.returncode = -15
-        for w in self._waiters:
-            if not w.done():
-                w.set_result(self.returncode)
-
-    def kill(self) -> None:
-        self.killed = True
-        self.terminated = True
-        self.returncode = -9
-        for w in self._waiters:
-            if not w.done():
-                w.set_result(self.returncode)
-
-    async def wait(self) -> int:
-        if self.returncode is not None:
-            return self.returncode
-        fut: asyncio.Future[int] = asyncio.get_running_loop().create_future()
-        self._waiters.append(fut)
-        return await fut
+    return SessionService(
+        settings,
+        db,
+        catalog,
+        runtime,
+        ProxyRegistry(),
+        connection_service,
+        HostTrustService(settings, db),
+    )
 
 
 def _install_happy_open_stubs(
     monkeypatch: pytest.MonkeyPatch,
     *,
-    tunnel_proc: _FakeTunnelProc | None = None,
     remote: RuntimeIdentity | None = None,
     health_ok: bool = True,
 ) -> dict[str, Any]:
     """Install fakes for every ``_do_open`` dependency except ``mark_ready``.
 
-    Returns a state dict the test can inspect (tunnel proc, stop calls, ...).
+    Returns a state dict the test can inspect (stop calls, ...).
     """
 
     state: dict[str, Any] = {
-        "tunnel_proc": tunnel_proc or _FakeTunnelProc(),
         "stop_calls": list[SessionId](),
         "remove_calls": list[SessionId](),
         "verify_calls": list[int](),
     }
 
-    async def _capabilities(self: RuntimeService, alias: str) -> RuntimeCapabilities:
+    async def _capabilities(
+        self: RuntimeService, connection: asyncssh.SSHClientConnection
+    ) -> RuntimeCapabilities:
+        del connection
         return RuntimeCapabilities(
             platform="linux", arch="x64", helper_version="v1", available=True
         )
 
-    async def _ensure_installed(self: RuntimeService, alias: str, platform: str) -> None:
+    async def _ensure_installed(
+        self: RuntimeService, connection: asyncssh.SSHClientConnection, platform: str
+    ) -> None:
+        del connection, platform
         return None
 
     async def _start_session(
-        self: RuntimeService, alias: str, session_id: SessionId
+        self: RuntimeService, connection: asyncssh.SSHClientConnection, session_id: SessionId
     ) -> RuntimeIdentity:
+        del connection, session_id
         return remote or RuntimeIdentity(
             pid=4242,
             port=9876,
@@ -173,19 +234,27 @@ def _install_happy_open_stubs(
             session_dir="/tmp/ovs",
         )
 
-    async def _stop_session(self: RuntimeService, alias: str, session_id: SessionId) -> bool:
+    async def _stop_session(
+        self: RuntimeService, connection: asyncssh.SSHClientConnection, session_id: SessionId
+    ) -> bool:
+        del connection
         state["stop_calls"].append(session_id)
         return True
 
-    async def _remove_session(self: RuntimeService, alias: str, session_id: SessionId) -> None:
+    async def _remove_session(
+        self: RuntimeService, connection: asyncssh.SSHClientConnection, session_id: SessionId
+    ) -> bool:
+        del connection
         state["remove_calls"].append(session_id)
-        return None
+        return True
 
-    async def _start_local_forward(
-        settings: Settings, alias: str, remote_port: int
-    ) -> tuple[TunnelIdentity, _FakeTunnelProc]:
-        identity = TunnelIdentity(local_port=54321, pid=99999)
-        return identity, state["tunnel_proc"]
+    async def _inspect_session(
+        self: RuntimeService,
+        connection: asyncssh.SSHClientConnection,
+        session_id: SessionId,
+    ) -> dict[str, Any]:
+        del connection, session_id
+        return {"running": False}
 
     async def _verify(self: SessionService, session_id: SessionId, local_port: int) -> None:
         state["verify_calls"].append(local_port)
@@ -201,7 +270,7 @@ def _install_happy_open_stubs(
     monkeypatch.setattr(RuntimeService, "start_session", _start_session)
     monkeypatch.setattr(RuntimeService, "stop_session", _stop_session)
     monkeypatch.setattr(RuntimeService, "remove_session", _remove_session)
-    monkeypatch.setattr(sessions_mod, "start_local_forward", _start_local_forward)
+    monkeypatch.setattr(RuntimeService, "inspect_session", _inspect_session)
     monkeypatch.setattr(SessionService, "_verify_editor_health", _verify)
     return state
 
@@ -221,7 +290,10 @@ async def test_runtime_error_marks_internal_error_row(
     capacity that remains owned (row persists)."""
     state = _install_happy_open_stubs(monkeypatch)
 
-    async def _boom(self: RuntimeService, alias: str, session_id: SessionId) -> RuntimeIdentity:
+    async def _boom(
+        self: RuntimeService, connection: asyncssh.SSHClientConnection, session_id: SessionId
+    ) -> RuntimeIdentity:
+        del connection, session_id
         raise RuntimeError("synthetic bug in remote helper")
 
     monkeypatch.setattr(RuntimeService, "start_session", _boom)
@@ -245,7 +317,7 @@ async def test_runtime_error_marks_internal_error_row(
     assert sid in service._capacity_owned
     assert len(service._capacity_owned) == 1
 
-    assert service._tunnel_processes.get(sid) is None
+    assert service._tunnels.get(sid) is None
     assert state["stop_calls"] == []
     assert service._registry.lookup(sid) is None
 
@@ -259,14 +331,23 @@ async def test_runtime_error_releases_capacity_after_close(
     and releases the capacity reservation exactly once."""
     _install_happy_open_stubs(monkeypatch)
 
-    async def _boom(self: RuntimeService, alias: str, session_id: SessionId) -> RuntimeIdentity:
+    async def _boom(
+        self: RuntimeService, connection: asyncssh.SSHClientConnection, session_id: SessionId
+    ) -> RuntimeIdentity:
+        del connection, session_id
         raise RuntimeError("synthetic")
 
-    async def _stop(self: RuntimeService, alias: str, session_id: SessionId) -> bool:
+    async def _stop(
+        self: RuntimeService, connection: asyncssh.SSHClientConnection, session_id: SessionId
+    ) -> bool:
+        del connection, session_id
         return True
 
-    async def _remove(self: RuntimeService, alias: str, session_id: SessionId) -> None:
-        return None
+    async def _remove(
+        self: RuntimeService, connection: asyncssh.SSHClientConnection, session_id: SessionId
+    ) -> bool:
+        del connection, session_id
+        return True
 
     monkeypatch.setattr(RuntimeService, "start_session", _boom)
     monkeypatch.setattr(RuntimeService, "stop_session", _stop)
@@ -308,9 +389,8 @@ async def test_cancel_after_remote_triggers_cleanup_and_reraises(
     """CancelledError after the remote is created (before mark_ready) triggers
     best-effort cleanup of the remote, marks an ``error`` row, and re-raises.
 
-    The row persists — the safer contract per Plan §14.1 step 6 ("preserve
-    evidence when safety cannot be established") — so capacity remains owned
-    until close()/retry() reclaims it.
+    The row persists when cleanup cannot prove safety, so capacity remains
+    owned until close or retry reclaims it.
     """
     state = _install_happy_open_stubs(monkeypatch)
     cancel_trigger: asyncio.Event = asyncio.Event()
@@ -341,7 +421,7 @@ async def test_cancel_after_remote_triggers_cleanup_and_reraises(
     assert row.state == SessionState.ERROR
     assert row.error_code == ErrorCode.INTERNAL_ERROR.value
     assert state["stop_calls"] == [sid]
-    assert service._tunnel_processes.get(sid) is None
+    assert service._tunnels.get(sid) is None
     assert service._registry.lookup(sid) is None
     assert sid in service._capacity_owned
 
@@ -356,11 +436,17 @@ async def test_capacity_released_exactly_once_after_cancel_then_close(
     _install_happy_open_stubs(monkeypatch)
     cancel_trigger: asyncio.Event = asyncio.Event()
 
-    async def _stop(self: RuntimeService, alias: str, session_id: SessionId) -> bool:
+    async def _stop(
+        self: RuntimeService, connection: asyncssh.SSHClientConnection, session_id: SessionId
+    ) -> bool:
+        del connection, session_id
         return True
 
-    async def _remove(self: RuntimeService, alias: str, session_id: SessionId) -> None:
-        return None
+    async def _remove(
+        self: RuntimeService, connection: asyncssh.SSHClientConnection, session_id: SessionId
+    ) -> bool:
+        del connection, session_id
+        return True
 
     monkeypatch.setattr(RuntimeService, "stop_session", _stop)
     monkeypatch.setattr(RuntimeService, "remove_session", _remove)
@@ -409,7 +495,7 @@ async def test_mark_ready_transaction_is_shielded_from_cancellation(
     ``ready``. Live resources and capacity are preserved for the now-ready
     session so close()/retry() remains the sole owner of teardown.
     """
-    state = _install_happy_open_stubs(monkeypatch)
+    _install_happy_open_stubs(monkeypatch)
 
     in_mark_ready: asyncio.Event = asyncio.Event()
     proceed: asyncio.Future[None] = asyncio.get_running_loop().create_future()
@@ -458,10 +544,12 @@ async def test_mark_ready_transaction_is_shielded_from_cancellation(
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    assert service._tunnel_processes.get(sid) is state["tunnel_proc"]
+    tunnel = service._tunnels.get(sid)
+    assert tunnel is not None
+    assert tunnel.listener is not None
     assert service._registry.lookup(sid) == 54321
     assert sid in service._capacity_owned
-    assert state["tunnel_proc"].terminated is False
+    assert not cast(_FakeListener, tunnel.listener).closed
 
 
 async def test_gateway_error_path_does_not_double_release_capacity(
@@ -474,11 +562,17 @@ async def test_gateway_error_path_does_not_double_release_capacity(
     Closing afterwards releases exactly once."""
     _install_happy_open_stubs(monkeypatch, health_ok=False)
 
-    async def _stop(self: RuntimeService, alias: str, session_id: SessionId) -> bool:
+    async def _stop(
+        self: RuntimeService, connection: asyncssh.SSHClientConnection, session_id: SessionId
+    ) -> bool:
+        del connection, session_id
         return True
 
-    async def _remove(self: RuntimeService, alias: str, session_id: SessionId) -> None:
-        return None
+    async def _remove(
+        self: RuntimeService, connection: asyncssh.SSHClientConnection, session_id: SessionId
+    ) -> bool:
+        del connection, session_id
+        return True
 
     monkeypatch.setattr(RuntimeService, "stop_session", _stop)
     monkeypatch.setattr(RuntimeService, "remove_session", _remove)
@@ -501,7 +595,7 @@ async def test_gateway_error_path_does_not_double_release_capacity(
     assert sid in service._capacity_owned
 
     # Tunnel was acquired and must have been torn down in cleanup reverse order.
-    assert service._tunnel_processes.get(sid) is None
+    assert service._tunnels.get(sid) is None
     assert service._registry.lookup(sid) is None
 
     await service.close("host-a")
@@ -525,7 +619,7 @@ async def test_run_open_converts_unhandled_bug_into_error_row(
 ) -> None:
     """If a programming bug raises before ``_do_open`` finishes cleanup, the
     task wrapper still converts the residual ``starting`` row into a sanitized
-    ``internal_error`` row (Plan §14.1 step 5)."""
+    ``internal_error`` row."""
 
     async def _broken_do_open(self: SessionService, session_id: SessionId, alias: str) -> Any:
         raise RuntimeError("bug inside _do_open before any cleanup ran")

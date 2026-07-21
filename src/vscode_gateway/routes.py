@@ -3,8 +3,9 @@ from __future__ import annotations
 import uuid
 from contextlib import suppress
 from pathlib import Path
+from typing import Annotated
 
-from fastapi import APIRouter, Depends, Form, HTTPException, Request
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import (
     HTMLResponse,
     JSONResponse,
@@ -25,20 +26,33 @@ from vscode_gateway.auth import (
     verify_csrf,
     verify_password,
 )
-from vscode_gateway.db import get_session
-from vscode_gateway.errors import GatewayError
+from vscode_gateway.db import get_session, get_session_by_alias
+from vscode_gateway.errors import ErrorCode, GatewayError
+from vscode_gateway.host_trust import HostTrustService
 from vscode_gateway.models import (
+    SSH_KEY_TYPES,
     CatalogResponse,
+    HostKeyChallenge,
+    KeyUploadResponse,
     SessionState,
     SshConfigResponse,
     SshConfigUpdateRequest,
+    SshKeyInventory,
+    SshKeySlot,
+    SshKeyType,
+    TrustHostKeyRequest,
     VersionResponse,
 )
 from vscode_gateway.proxy import ProxyAdapter, ProxyRegistry
 from vscode_gateway.readiness import Readiness, ReadinessPhase
 from vscode_gateway.sessions import SessionService
 from vscode_gateway.settings import Settings
-from vscode_gateway.ssh import SshCatalog, compute_config_revision, validate_and_save_config
+from vscode_gateway.ssh_config import (
+    SshCatalog,
+    compute_config_revision,
+    validate_and_save_config,
+)
+from vscode_gateway.ssh_keys import SshKeyService
 
 
 def _debug_headers(request: Request) -> dict[str, str]:
@@ -67,7 +81,7 @@ def _require_ready(request: Request) -> None:
 
     The check returns 503 with a problem+json body so load balancers
     stop routing mutations and editors during startup and degraded
-    recovery (HI-04, Plan §10.3 / §15).
+    recovery.
     """
     try:
         readiness: Readiness = request.app.state.readiness
@@ -101,6 +115,17 @@ def _problem(exc: GatewayError, request_id: str) -> JSONResponse:
     )
 
 
+def _host_key_payload(challenge: HostKeyChallenge) -> dict[str, str | int]:
+    return {
+        "role": challenge.role,
+        "host": challenge.host,
+        "port": challenge.port,
+        "algorithm": challenge.algorithm,
+        "fingerprint": challenge.fingerprint,
+        "publicKey": challenge.public_key,
+    }
+
+
 def create_routes(
     settings: Settings,
     session_service: SessionService,
@@ -108,6 +133,9 @@ def create_routes(
     proxy_adapter: ProxyAdapter,
     proxy_registry: ProxyRegistry,
     readiness: Readiness,  # wired explicitly; routes read state from request.app.state
+    *,
+    key_service: SshKeyService,
+    host_trust_service: HostTrustService,
 ) -> APIRouter:
     _ = readiness
     router = APIRouter()
@@ -181,8 +209,9 @@ def create_routes(
     @router.get("/api/sessions", dependencies=[Depends(require_auth)])
     async def list_sessions(request: Request) -> JSONResponse:
         workspaces = await session_service.get_workspaces_full()
-        ws_data: list[dict[str, object]] = [
-            {
+        ws_data: list[dict[str, object]] = []
+        for ws in workspaces:
+            workspace: dict[str, object] = {
                 "alias": ws.alias,
                 "state": ws.state,
                 "sessionId": str(ws.session_id) if ws.session_id else None,
@@ -199,8 +228,9 @@ def create_routes(
                 "canRetry": ws.can_retry,
                 "catalogMissing": ws.catalog_missing,
             }
-            for ws in workspaces
-        ]
+            if ws.ssh_host_key is not None:
+                workspace["sshHostKey"] = _host_key_payload(ws.ssh_host_key)
+            ws_data.append(workspace)
         return JSONResponse({"workspaces": ws_data})
 
     @router.get("/api/sessions/{alias:path}")
@@ -212,21 +242,22 @@ def create_routes(
         view = await session_service.get_session_view(alias)
         if view is None:
             raise HTTPException(status_code=404, detail="Session not found")
-        return JSONResponse(
-            {
-                "id": str(view.id),
-                "alias": view.alias,
-                "state": view.state.value,
-                "stage": view.stage.value if view.stage else None,
-                "connectedClients": view.connected_clients,
-                "disconnectDeadline": view.disconnect_deadline.isoformat()
-                if view.disconnect_deadline
-                else None,
-                "editorUrl": view.editor_url,
-                "errorCode": view.error_code,
-                "errorMessage": view.error_message,
-            }
-        )
+        response: dict[str, object] = {
+            "id": str(view.id),
+            "alias": view.alias,
+            "state": view.state.value,
+            "stage": view.stage.value if view.stage else None,
+            "connectedClients": view.connected_clients,
+            "disconnectDeadline": view.disconnect_deadline.isoformat()
+            if view.disconnect_deadline
+            else None,
+            "editorUrl": view.editor_url,
+            "errorCode": view.error_code,
+            "errorMessage": view.error_message,
+        }
+        if view.ssh_host_key is not None:
+            response["sshHostKey"] = _host_key_payload(view.ssh_host_key)
+        return JSONResponse(response)
 
     @router.post("/api/sessions/{alias:path}/open", dependencies=[Depends(require_ready)])
     async def open_session(
@@ -362,99 +393,120 @@ def create_routes(
 
     @router.get("/api/ssh/keys", dependencies=[Depends(require_auth)])
     async def list_keys(request: Request) -> JSONResponse:
-        keys_dir = settings.ssh_keys_dir
-        keys: list[dict[str, object]] = []
-        if keys_dir.exists():
-            for p in sorted(keys_dir.iterdir()):
-                if p.suffix == ".pub":
-                    name = p.stem
-                    try:
-                        content = p.read_text(encoding="utf-8").strip()
-                        parts = content.split()
-                        algorithm = parts[0] if len(parts) > 0 else "unknown"
-                        fingerprint = parts[1] if len(parts) > 1 else None
-                    except OSError:
-                        algorithm = "unknown"
-                        fingerprint = None
-                        content = None
-
-                    keys.append(
-                        {
-                            "name": name,
-                            "algorithm": algorithm,
-                            "fingerprint": fingerprint,
-                        }
-                    )
-        return JSONResponse({"keys": keys})
+        metadata = await key_service.list_metadata()
+        slots: dict[SshKeyType, SshKeySlot] = {}
+        for key_type in SSH_KEY_TYPES:
+            key = metadata[key_type]
+            if key is None:
+                slots[key_type] = SshKeySlot(present=False)
+            else:
+                slots[key_type] = SshKeySlot(
+                    present=True,
+                    name=key.name,
+                    algorithm=key.algorithm,
+                    fingerprint=key.fingerprint,
+                )
+        return JSONResponse(SshKeyInventory(keys=slots).model_dump(exclude_none=True))
 
     @router.post("/api/ssh/keys", dependencies=[Depends(require_ready)])
-    async def create_key(request: Request) -> JSONResponse:
+    async def create_key(
+        request: Request,
+        name: Annotated[str, Form(...)],
+        private_key: Annotated[UploadFile, File(...)],
+    ) -> JSONResponse:
         await require_auth.__call__(request)
         await require_csrf.__call__(request)
+        try:
+            private_key_bytes = await private_key.read(settings.ssh_key_upload_max_bytes + 1)
+            if len(private_key_bytes) > settings.ssh_key_upload_max_bytes:
+                raise GatewayError(
+                    ErrorCode.SSH_KEY_INVALID,
+                    f"Private key exceeds {settings.ssh_key_upload_max_bytes} bytes",
+                    status_code=400,
+                )
 
-        import secrets
-
-        from vscode_gateway.ssh import run_process
-
-        key_name = f"key_{secrets.token_hex(4)}"
-        key_path = settings.ssh_keys_dir / key_name
-        result = await run_process(
-            [
-                settings.ssh_keygen_executable,
-                "-t",
-                "ed25519",
-                "-f",
-                str(key_path),
-                "-N",
-                "",
-                "-C",
-                f"vscode-gateway-{key_name}",
-            ],
-            timeout=settings.subprocess_timeout,
-        )
-        if result.exit_code != 0:
-            return JSONResponse(
-                {
-                    "error": "Key generation failed",
-                    "detail": result.stderr.decode("utf-8", errors="replace")[:500],
-                },
-                status_code=500,
+            metadata = await key_service.import_upload(
+                name=name,
+                private_key_bytes=private_key_bytes,
             )
+            public_key = await key_service.get_public_key_text(metadata.type)
+            return JSONResponse(
+                KeyUploadResponse(
+                    name=metadata.name,
+                    type=metadata.type,
+                    algorithm=metadata.algorithm,
+                    fingerprint=metadata.fingerprint,
+                    publicKey=public_key,
+                ).model_dump(),
+                status_code=201,
+            )
+        except GatewayError as exc:
+            return _problem(exc, str(uuid.uuid4()))
 
-        pub_content = ""
-        with suppress(OSError):
-            pub_content = (key_path.with_suffix(".pub")).read_text(encoding="utf-8").strip()
-
-        return JSONResponse(
-            {"name": key_name, "public_key": pub_content},
-            status_code=201,
-        )
-
-    @router.get("/api/ssh/keys/{name}.pub")
-    async def get_key_public(request: Request, name: str) -> Response:
+    @router.get("/api/ssh/keys/{type}/public")
+    async def get_key_public(request: Request, type: SshKeyType) -> Response:
         await require_auth.__call__(request)
-        pub_path = settings.ssh_keys_dir / f"{name}.pub"
-        if not pub_path.exists():
-            raise HTTPException(status_code=404, detail="Key not found")
-        content = pub_path.read_text(encoding="utf-8")
-        return PlainTextResponse(content)
+        try:
+            content = await key_service.get_public_key_text(type)
+            return PlainTextResponse(content, media_type="text/plain")
+        except GatewayError as exc:
+            return _problem(exc, str(uuid.uuid4()))
 
-    @router.delete("/api/ssh/keys/{name}", dependencies=[Depends(require_ready)])
-    async def delete_key(request: Request, name: str) -> Response:
+    @router.delete("/api/ssh/keys/{type}", dependencies=[Depends(require_ready)])
+    async def delete_key(request: Request, type: SshKeyType) -> Response:
         await require_auth.__call__(request)
         await require_csrf.__call__(request)
-        priv_path = settings.ssh_keys_dir / name
-        pub_path = settings.ssh_keys_dir / f"{name}.pub"
-        deleted = False
-        if priv_path.exists():
-            priv_path.unlink()
-            deleted = True
-        if pub_path.exists():
-            pub_path.unlink()
-            deleted = True
-        if not deleted:
-            raise HTTPException(status_code=404, detail="Key not found")
-        return Response(status_code=204)
+        try:
+            await key_service.delete_key(type)
+            return Response(status_code=204)
+        except GatewayError as exc:
+            return _problem(exc, str(uuid.uuid4()))
+
+    @router.post("/api/ssh/hosts/trust", dependencies=[Depends(require_ready)])
+    async def trust_host_key(
+        request: Request,
+        body: TrustHostKeyRequest,
+    ) -> Response:
+        await require_auth.__call__(request)
+        await require_csrf.__call__(request)
+        try:
+            session = await get_session_by_alias(request.app.state.db, body.alias)
+            if session is None:
+                raise GatewayError(
+                    ErrorCode.ALIAS_NOT_FOUND,
+                    f"No session exists for alias '{body.alias}'",
+                    status_code=404,
+                )
+
+            challenge = await host_trust_service.get_challenge(session.id)
+            if challenge is None:
+                raise GatewayError(
+                    ErrorCode.SSH_HOST_TRUST_MISMATCH,
+                    "No pending host-key challenge for this session",
+                    status_code=404,
+                )
+            if (
+                challenge.alias != body.alias
+                or challenge.host != body.host
+                or challenge.port != body.port
+                or challenge.public_key != body.publicKey
+            ):
+                raise GatewayError(
+                    ErrorCode.SSH_HOST_TRUST_MISMATCH,
+                    "Submitted host/port/public key does not match the pending challenge",
+                    status_code=409,
+                )
+
+            await host_trust_service.trust(
+                session_id=session.id,
+                host=body.host,
+                port=body.port,
+                public_key=body.publicKey,
+                replace=body.replace,
+            )
+            return Response(status_code=204)
+        except GatewayError as exc:
+            return _problem(exc, str(uuid.uuid4()))
 
     # --- Operations ---
     @router.get("/healthz")
@@ -480,17 +532,13 @@ def create_routes(
 
     @router.websocket("/editor/{session_id}/{rest_of_path:path}")
     async def proxy_ws_route(ws: WebSocket, session_id: str, rest_of_path: str):
-        # Readiness gate (HI-04): reject editor traffic while the gateway
-        # is starting, recovering, or degraded. Use a stable close code
-        # so the browser cannot infer internals.
+        # Reject editor traffic while the gateway is not ready.
         readiness: Readiness | None = getattr(ws.app.state, "readiness", None)
         if readiness is None or readiness.phase != ReadinessPhase.READY:
             await ws.close(code=4503)
             return
 
-        # Per plan §16.3: authenticate before ``accept`` and before any
-        # upstream connection. We reject with a stable close code so no
-        # internals leak and no upstream contact occurs.
+        # Authenticate before accepting or contacting the upstream editor.
         if not is_authenticated(ws):
             await ws.close(code=4401)
             return

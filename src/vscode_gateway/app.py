@@ -20,6 +20,7 @@ from starlette.responses import JSONResponse, Response
 from vscode_gateway.auth import SecurityHeadersMiddleware
 from vscode_gateway.db import open_database, run_migrations
 from vscode_gateway.errors import GatewayError
+from vscode_gateway.host_trust import HostTrustService
 from vscode_gateway.lockfile import ProcessLock, check_multi_worker_env
 from vscode_gateway.proxy import ProxyAdapter, ProxyRegistry
 from vscode_gateway.readiness import Readiness, ReadinessPhase, UnresolvedCounts
@@ -27,7 +28,9 @@ from vscode_gateway.routes import create_routes
 from vscode_gateway.runtime import RuntimeService
 from vscode_gateway.sessions import SessionService
 from vscode_gateway.settings import Settings
-from vscode_gateway.ssh import SshCatalog
+from vscode_gateway.ssh_config import SshCatalog
+from vscode_gateway.ssh_connection import SshConnectionService
+from vscode_gateway.ssh_keys import SshKeyService
 
 BackgroundTaskSet = set[asyncio.Task[None]]
 BackgroundSpawner = Callable[[Awaitable[None]], asyncio.Task[None]]
@@ -75,19 +78,11 @@ async def lifespan(app: FastAPI):
     http_client: httpx.AsyncClient | None = None
     db: aiosqlite.Connection | None = None
     process_lock: ProcessLock | None = None
+    session_service: SessionService | None = None
 
-    # Phase starts as ``starting``. Any failure in the mandatory startup
-    # sequence (singleton lock, DB open, migrations, catalog init,
-    # capacity rebuild, recovery) reports a bounded ``degraded`` state
-    # and continues serving 503 rather than crashing, so a load balancer
-    # sees the failure signal and operators can inspect /readyz (HI-04).
+    # Startup failures leave the app degraded so /readyz remains available.
     try:
-        # HI-07: acquire the OS singleton lock **before** opening any
-        # mutable service (DB, sessions, http client) and hold it for
-        # the entire process lifetime. A second worker or instance
-        # sharing this state directory fails fast with ``BlockingIOError``
-        # and is reported as a degraded startup so /readyz surfaces the
-        # condition (Plan §6.1).
+        # Acquire the singleton lock before opening mutable services.
         process_lock = ProcessLock(settings.state_dir)
         process_lock.acquire()
         app.state.process_lock = process_lock  # type: ignore[assignment]  # state is Any
@@ -96,12 +91,7 @@ async def lifespan(app: FastAPI):
         migrations_dir = Path(__file__).parent / "migrations"
         await run_migrations(db, migrations_dir)
 
-        # Process-wide upstream client (Plan §16.2). ``trust_env=False``
-        # prevents ``HTTP_PROXY``/``HTTPS_PROXY``/``ALL_PROXY``/``NO_PROXY``
-        # env vars from redirecting loopback editor traffic through an
-        # unrelated forward proxy. ``follow_redirects=False`` keeps the
-        # proxy from chasing upstream 3xx responses. Explicit Timeouts
-        # and Limits cap resource use (HI-06).
+        # Loopback editor traffic must not use ambient proxy settings.
         http_client = httpx.AsyncClient(
             trust_env=False,
             timeout=httpx.Timeout(
@@ -117,9 +107,20 @@ async def lifespan(app: FastAPI):
         catalog = SshCatalog(settings)
         await catalog.refresh()
 
+        key_service = SshKeyService(settings, db)
+        host_trust_service = HostTrustService(settings, db)
+        connection_service = SshConnectionService(settings, key_service, host_trust_service)
         runtime = RuntimeService(settings)
         proxy_registry = ProxyRegistry()
-        session_service = SessionService(settings, db, catalog, runtime, proxy_registry)
+        session_service = SessionService(
+            settings,
+            db,
+            catalog,
+            runtime,
+            proxy_registry,
+            connection_service,
+            host_trust_service,
+        )
         proxy_adapter = ProxyAdapter(proxy_registry, http_client, session_service)
 
         spawner = _make_spawner(bg_tasks)
@@ -132,10 +133,20 @@ async def lifespan(app: FastAPI):
         app.state.proxy_adapter = proxy_adapter
         app.state.proxy_registry = proxy_registry
         app.state.runtime = runtime
+        app.state.key_service = key_service
+        app.state.host_trust_service = host_trust_service
+        app.state.connection_service = connection_service
         app.state.bg_tasks = bg_tasks  # type: ignore[assignment]  # state is Any
 
         router = create_routes(
-            settings, session_service, catalog, proxy_adapter, proxy_registry, readiness
+            settings,
+            session_service,
+            catalog,
+            proxy_adapter,
+            proxy_registry,
+            readiness,
+            key_service=key_service,
+            host_trust_service=host_trust_service,
         )
         app.include_router(router)
 
@@ -175,10 +186,6 @@ async def lifespan(app: FastAPI):
             logger.error("startup_recovery_failed", error=str(exc))
             await readiness.mark_degraded(f"recovery failed: {exc}", UnresolvedCounts())
     except Exception as exc:
-        # Mandatory pre-recovery setup failed (DB open, migrations, catalog
-        # initialization). We cannot serve sessions, but we still serve
-        # /readyz with 503 so operators see the failure rather than a
-        # crashed process.
         logger.error("startup_mandatory_failed", error=str(exc))
         await readiness.fail(f"mandatory startup failed: {exc}")
 
@@ -189,6 +196,8 @@ async def lifespan(app: FastAPI):
         task.cancel()
     if bg_tasks:
         await asyncio.gather(*bg_tasks, return_exceptions=True)
+    if session_service is not None:
+        await session_service.shutdown()
     if http_client is not None:
         await http_client.aclose()
     if db is not None:
@@ -223,12 +232,16 @@ def _validate_secure_cookie_settings(settings: Settings) -> None:
     if scheme != "https":
         msg = (
             "secure_cookies is True but canonical_origin is not HTTPS "
-            f"(got {settings.canonical_origin!r}); refusing to start (HI-05)."
+            f"(got {settings.canonical_origin!r}); refusing to start."
         )
         raise RuntimeError(msg)
 
 
 def create_app() -> FastAPI:
+    import os
+
+    os.umask(0o077)
+
     settings = Settings()
     configure_logging(settings)
     logger = structlog.get_logger()

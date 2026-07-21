@@ -184,7 +184,10 @@ cmd_session_inspect() {
     [ -n "$session_id" ] || die "missing_argument" "session_id is required"
 
     local session_dir="$SESSIONS_DIR/$session_id"
-    [ -d "$session_dir" ] || die "session_not_found" "Session directory not found"
+    if [ ! -d "$session_dir" ]; then
+        printf '{"running":false,"reason":"absent","session_dir":"%s"}\n' "$session_dir"
+        return
+    fi
 
     local pid=$(cat "$session_dir/pid" 2>/dev/null || echo "")
     if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then

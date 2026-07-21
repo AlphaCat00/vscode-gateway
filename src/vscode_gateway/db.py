@@ -298,3 +298,144 @@ async def set_last_connected(db: aiosqlite.Connection, session_id: str) -> None:
         (now.isoformat(), now.isoformat(), session_id),
     )
     await db.commit()
+
+
+# SSH key display metadata. Key material remains on disk.
+
+
+async def insert_ssh_key_metadata(
+    db: aiosqlite.Connection,
+    *,
+    type_: str,
+    name: str,
+    algorithm: str,
+    fingerprint: str,
+) -> None:
+    now = datetime.now(UTC).isoformat()
+    await db.execute(
+        """INSERT INTO ssh_keys
+            (type, name, algorithm, fingerprint, created_at)
+           VALUES (?, ?, ?, ?, ?)""",
+        (type_, name, algorithm, fingerprint, now),
+    )
+    await db.commit()
+
+
+async def get_ssh_key_metadata(
+    db: aiosqlite.Connection, type_: str
+) -> tuple[str, str, str, str] | None:
+    """Return ``(name, algorithm, fingerprint, created_at)`` for ``type_`` or None."""
+    async with db.execute(
+        "SELECT name, algorithm, fingerprint, created_at FROM ssh_keys WHERE type = ?",
+        (type_,),
+    ) as cursor:
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        return row["name"], row["algorithm"], row["fingerprint"], row["created_at"]
+
+
+async def list_ssh_key_metadata(
+    db: aiosqlite.Connection,
+) -> dict[str, tuple[str, str, str]]:
+    """Return ``{type: (name, algorithm, fingerprint)}`` for present slots."""
+    result: dict[str, tuple[str, str, str]] = {}
+    async with db.execute("SELECT type, name, algorithm, fingerprint FROM ssh_keys") as cursor:
+        rows = await cursor.fetchall()
+    for row in rows:
+        result[row["type"]] = (row["name"], row["algorithm"], row["fingerprint"])
+    return result
+
+
+async def delete_ssh_key_metadata(db: aiosqlite.Connection, type_: str) -> None:
+    await db.execute("DELETE FROM ssh_keys WHERE type = ?", (type_,))
+    await db.commit()
+
+
+# Pending host-key challenges survive process restarts.
+
+
+async def upsert_pending_host_key(
+    db: aiosqlite.Connection,
+    *,
+    session_id: str,
+    role: str,
+    alias: str,
+    host: str,
+    port: int,
+    algorithm: str,
+    fingerprint: str,
+    public_key: str,
+) -> None:
+    now = datetime.now(UTC).isoformat()
+    await db.execute(
+        """INSERT INTO pending_host_keys
+            (session_id, role, alias, host, port, algorithm, fingerprint,
+             public_key, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(session_id) DO UPDATE SET
+            role = excluded.role,
+            alias = excluded.alias,
+            host = excluded.host,
+            port = excluded.port,
+            algorithm = excluded.algorithm,
+            fingerprint = excluded.fingerprint,
+            public_key = excluded.public_key,
+            created_at = excluded.created_at
+        """,
+        (session_id, role, alias, host, port, algorithm, fingerprint, public_key, now),
+    )
+    await db.commit()
+
+
+async def get_pending_host_key(
+    db: aiosqlite.Connection, session_id: str
+) -> dict[str, object] | None:
+    async with db.execute(
+        """SELECT session_id, role, alias, host, port, algorithm, fingerprint,
+                  public_key, created_at
+           FROM pending_host_keys WHERE session_id = ?""",
+        (session_id,),
+    ) as cursor:
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        return {
+            "session_id": row["session_id"],
+            "role": row["role"],
+            "alias": row["alias"],
+            "host": row["host"],
+            "port": row["port"],
+            "algorithm": row["algorithm"],
+            "fingerprint": row["fingerprint"],
+            "public_key": row["public_key"],
+            "created_at": row["created_at"],
+        }
+
+
+async def delete_pending_host_key(db: aiosqlite.Connection, session_id: str) -> None:
+    await db.execute("DELETE FROM pending_host_keys WHERE session_id = ?", (session_id,))
+    await db.commit()
+
+
+async def list_pending_host_keys(db: aiosqlite.Connection) -> list[dict[str, object]]:
+    async with db.execute(
+        """SELECT session_id, role, alias, host, port, algorithm, fingerprint,
+                  public_key, created_at
+           FROM pending_host_keys"""
+    ) as cursor:
+        rows = await cursor.fetchall()
+    return [
+        {
+            "session_id": row["session_id"],
+            "role": row["role"],
+            "alias": row["alias"],
+            "host": row["host"],
+            "port": row["port"],
+            "algorithm": row["algorithm"],
+            "fingerprint": row["fingerprint"],
+            "public_key": row["public_key"],
+            "created_at": row["created_at"],
+        }
+        for row in rows
+    ]

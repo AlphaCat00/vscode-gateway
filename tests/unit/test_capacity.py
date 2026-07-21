@@ -1,16 +1,18 @@
-"""Unit tests for session-ID-keyed capacity accounting (HI-01 correction)."""
+"""Unit tests for session-ID-keyed capacity accounting."""
 
 # pyright: reportPrivateUsage=false
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import aiosqlite
+import asyncssh
 import pytest
 
 from vscode_gateway.db import (
@@ -21,8 +23,10 @@ from vscode_gateway.db import (
     run_migrations,
 )
 from vscode_gateway.errors import ErrorCode, GatewayError
+from vscode_gateway.host_trust import HostTrustService
 from vscode_gateway.models import (
     CatalogSnapshot,
+    HostKeyRole,
     RecoveryReport,
     SessionId,
     SessionRecord,
@@ -34,15 +38,22 @@ from vscode_gateway.proxy import ProxyRegistry
 from vscode_gateway.runtime import RuntimeService
 from vscode_gateway.sessions import SessionService
 from vscode_gateway.settings import Settings
-from vscode_gateway.ssh import SshCatalog
+from vscode_gateway.ssh_config import SshCatalog
+from vscode_gateway.ssh_connection import (
+    SshConnection,
+    SshConnectionService,
+    _HostKeyCapturer,
+)
 
 
 def _make_settings(tmp_path: Path, *, capacity: int = 10) -> Settings:
     return Settings(
         state_dir=tmp_path / "state",
         runtime_dir=tmp_path / "runtime",
-        ssh_config_path=tmp_path / "ssh_config",
-        ssh_keys_dir=tmp_path / "keys",
+        ssh_dir=tmp_path / "ssh",
+        ssh_config_path=tmp_path / "ssh" / "config",
+        ssh_known_hosts_path=tmp_path / "ssh" / "known_hosts",
+        ssh_keys_dir=tmp_path / "ssh" / "keys",
         password_hash_path=tmp_path / "state" / "password.hash",
         session_secret_path=tmp_path / "state" / "session.secret",
         session_capacity=capacity,
@@ -76,6 +87,71 @@ def catalog(settings: Settings) -> SshCatalog:
     return cat
 
 
+class _FakeConnectionHandle:
+    def __init__(self) -> None:
+        self.closed = False
+        self.waited = False
+
+    def close(self) -> None:
+        self.closed = True
+
+    async def wait_closed(self) -> None:
+        self.waited = True
+
+
+class _FakeListener:
+    def __init__(self) -> None:
+        self.closed = False
+        self.waited = False
+        self._closed = asyncio.Event()
+
+    def close(self) -> None:
+        self.closed = True
+        self._closed.set()
+
+    async def wait_closed(self) -> None:
+        await self._closed.wait()
+        self.waited = True
+
+
+class _FakeConnectionService(SshConnectionService):
+    def __init__(self) -> None:
+        self.connections: list[SshConnection] = []
+        self.listeners: list[_FakeListener] = []
+
+    async def connect_for_session(
+        self,
+        *,
+        session_id: SessionId,
+        alias: str,
+        role: HostKeyRole = "target",
+    ) -> SshConnection:
+        del session_id, role
+        handle = _FakeConnectionHandle()
+        connection = SshConnection(
+            conn=cast(asyncssh.SSHClientConnection, handle),
+            listener=None,
+            local_port=0,
+            remote_port=0,
+            alias=alias,
+            capturer=_HostKeyCapturer(),
+        )
+        self.connections.append(connection)
+        return connection
+
+    async def forward_local_port(
+        self,
+        ssh_conn: SshConnection,
+        remote_port: int,
+    ) -> tuple[asyncssh.SSHListener, int]:
+        listener = _FakeListener()
+        self.listeners.append(listener)
+        ssh_conn.listener = cast(asyncssh.SSHListener, listener)
+        ssh_conn.local_port = 54321
+        ssh_conn.remote_port = remote_port
+        return cast(asyncssh.SSHListener, listener), 54321
+
+
 @pytest.fixture
 def runtime(settings: Settings) -> RuntimeService:
     return RuntimeService(settings)
@@ -87,8 +163,22 @@ def service(
     db: aiosqlite.Connection,
     catalog: SshCatalog,
     runtime: RuntimeService,
+    connection_service: _FakeConnectionService,
 ) -> SessionService:
-    return SessionService(settings, db, catalog, runtime, ProxyRegistry())
+    return SessionService(
+        settings,
+        db,
+        catalog,
+        runtime,
+        ProxyRegistry(),
+        connection_service,
+        HostTrustService(settings, db),
+    )
+
+
+@pytest.fixture
+def connection_service() -> _FakeConnectionService:
+    return _FakeConnectionService()
 
 
 def _make_record(
@@ -228,10 +318,22 @@ def inspect_stub(
     """Per-alias inspect_session return values; default: remote not running."""
     responses: dict[str, dict[str, Any]] = {}
 
-    async def _inspect(self: RuntimeService, alias: str, session_id: SessionId) -> dict[str, Any]:
-        return responses.get(alias, {"running": False, "identity_ok": False, "port": 0})
+    async def _inspect(
+        self: RuntimeService, connection: asyncssh.SSHClientConnection, session_id: SessionId
+    ) -> dict[str, Any]:
+        del connection, session_id
+        return responses.get("default", {"running": False, "identity_ok": False, "port": 0})
+
+    async def _remove(
+        self: RuntimeService,
+        connection: asyncssh.SSHClientConnection,
+        session_id: SessionId,
+    ) -> bool:
+        del connection, session_id
+        return True
 
     monkeypatch.setattr(RuntimeService, "inspect_session", _inspect)
+    monkeypatch.setattr(RuntimeService, "remove_session", _remove)
     yield responses
 
 
@@ -245,13 +347,13 @@ async def test_recover_all_rebuilds_ledger_from_persisted_rows(
     await insert_session(db, _make_record("host-a", sid=sid_a, state=SessionState.READY))
     await insert_session(db, _make_record("host-b", sid=sid_b, state=SessionState.STARTING))
 
-    # Both rows remain (READY→error, STARTING→error). Capacity ledger must
-    # contain every persisted session id.
+    # READY becomes an error row. STARTING is deleted only after inspection
+    # proves absence and remote metadata removal is confirmed.
     report = await service.recover_all()
 
     assert isinstance(report, RecoveryReport)
-    assert service._capacity_owned == {sid_a, sid_b}
-    assert len(service._capacity_owned) == 2
+    assert report.cleaned == 1
+    assert service._capacity_owned == {sid_a}
 
 
 async def test_recover_all_releases_capacity_for_cleaned_rows(
@@ -270,13 +372,16 @@ async def test_recover_all_releases_capacity_for_cleaned_rows(
     assert remaining == []
 
 
-async def test_recover_all_starting_running_no_port_releases(
+async def test_recover_all_starting_running_no_port_retains_evidence(
     service: SessionService,
     db: aiosqlite.Connection,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Forward declaration to satisfy pyright about inspect_stub signature.
-    async def _inspect(self: RuntimeService, alias: str, session_id: SessionId) -> dict[str, Any]:
+    async def _inspect(
+        self: RuntimeService, connection: asyncssh.SSHClientConnection, session_id: SessionId
+    ) -> dict[str, Any]:
+        del connection, session_id
         return {"running": True, "identity_ok": True, "port": 0}
 
     monkeypatch.setattr(RuntimeService, "inspect_session", _inspect)
@@ -286,8 +391,12 @@ async def test_recover_all_starting_running_no_port_releases(
 
     report = await service.recover_all()
 
-    assert report.cleaned == 1
-    assert sid not in service._capacity_owned
+    assert report.cleaned == 0
+    assert report.failed == 1
+    assert sid in service._capacity_owned
+    row = await get_session(db, str(sid))
+    assert row is not None
+    assert row.state == SessionState.ERROR
 
 
 async def test_max_sessions_enforced_after_recovery(
@@ -295,14 +404,26 @@ async def test_max_sessions_enforced_after_recovery(
     db: aiosqlite.Connection,
     catalog: SshCatalog,
     runtime: RuntimeService,
+    connection_service: _FakeConnectionService,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Capacity equals the number of pre-existing rows so the next open must
     # be rejected.
-    service = SessionService(settings, db, catalog, runtime, ProxyRegistry())
+    service = SessionService(
+        settings,
+        db,
+        catalog,
+        runtime,
+        ProxyRegistry(),
+        connection_service,
+        HostTrustService(settings, db),
+    )
 
-    async def _inspect(self: RuntimeService, alias: str, session_id: SessionId) -> dict[str, Any]:
-        return {"running": False, "identity_ok": False, "port": 0}
+    async def _inspect(
+        self: RuntimeService, connection: asyncssh.SSHClientConnection, session_id: SessionId
+    ) -> dict[str, Any]:
+        del connection, session_id
+        return {"running": True, "identity_ok": False, "port": 0}
 
     monkeypatch.setattr(RuntimeService, "inspect_session", _inspect)
 
@@ -331,19 +452,27 @@ async def test_max_sessions_enforced_after_recovery(
 async def test_do_close_releases_capacity_on_success(
     service: SessionService,
     db: aiosqlite.Connection,
+    connection_service: _FakeConnectionService,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     sid = uuid.uuid4()
     record = _make_record("host-a", sid=sid, state=SessionState.READY)
+    record.remote_pid = 1234
     await insert_session(db, record)
     service._capacity_acquire(sid)
 
     # Avoid touching real SSH/runtime helpers during the close path.
-    async def _no_stop(self: RuntimeService, alias: str, session_id: SessionId) -> bool:
+    async def _no_stop(
+        self: RuntimeService, connection: asyncssh.SSHClientConnection, session_id: SessionId
+    ) -> bool:
+        del connection, session_id
         return True
 
-    async def _no_remove(self: RuntimeService, alias: str, session_id: SessionId) -> None:
-        return None
+    async def _no_remove(
+        self: RuntimeService, connection: asyncssh.SSHClientConnection, session_id: SessionId
+    ) -> bool:
+        del connection, session_id
+        return True
 
     monkeypatch.setattr(RuntimeService, "stop_session", _no_stop)
     monkeypatch.setattr(RuntimeService, "remove_session", _no_remove)
@@ -353,6 +482,42 @@ async def test_do_close_releases_capacity_on_success(
     assert sid not in service._capacity_owned
     remaining = await list_sessions(db)
     assert remaining == []
+    handle = cast(_FakeConnectionHandle, connection_service.connections[-1].conn)
+    assert handle.closed is True
+    assert handle.waited is True
+
+
+async def test_recovery_inspection_failure_retains_error_row_and_capacity(
+    service: SessionService,
+    db: aiosqlite.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sid = uuid.uuid4()
+    record = _make_record("host-a", sid=sid, state=SessionState.ERROR)
+    record.error_code = ErrorCode.SSH_HOST_UNKNOWN.value
+    record.error_message = "Trust required"
+    record.remote_pid = 1234
+    await insert_session(db, record)
+
+    async def _inspect_failure(
+        self: RuntimeService,
+        connection: asyncssh.SSHClientConnection,
+        session_id: SessionId,
+    ) -> dict[str, Any]:
+        del self, connection, session_id
+        raise GatewayError(ErrorCode.SSH_UNREACHABLE, "temporary outage", status_code=502)
+
+    monkeypatch.setattr(RuntimeService, "inspect_session", _inspect_failure)
+
+    report = await service.recover_all()
+
+    assert report.cleaned == 0
+    assert report.failed == 1
+    assert sid in service._capacity_owned
+    remaining = await get_session(db, str(sid))
+    assert remaining is not None
+    assert remaining.error_code == ErrorCode.SSH_HOST_UNKNOWN.value
+    assert remaining.remote_pid == 1234
 
 
 async def test_do_close_retains_capacity_on_cleanup_failure(
@@ -370,7 +535,10 @@ async def test_do_close_retains_capacity_on_cleanup_failure(
     await insert_session(db, record)
     service._capacity_acquire(sid)
 
-    async def _fail_stop(self: RuntimeService, alias: str, session_id: SessionId) -> bool:
+    async def _fail_stop(
+        self: RuntimeService, connection: asyncssh.SSHClientConnection, session_id: SessionId
+    ) -> bool:
+        del connection, session_id
         raise GatewayError(ErrorCode.STOP_FAILED, "remote stop failed", status_code=500)
 
     monkeypatch.setattr(RuntimeService, "stop_session", _fail_stop)

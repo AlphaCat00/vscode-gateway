@@ -1,6 +1,6 @@
 """Tests for SSH catalog and alias discovery."""
 
-from vscode_gateway.ssh import compute_config_revision, discover_aliases
+from vscode_gateway.ssh_config import compute_config_revision, discover_aliases
 
 
 def test_discover_aliases_positive_literals() -> None:

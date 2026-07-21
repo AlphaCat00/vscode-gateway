@@ -28,17 +28,13 @@ HOP_BY_HOP_HEADERS: frozenset[str] = frozenset(
     }
 )
 
-# Gateway-specific request headers that must never be forwarded
-# upstream. The editor never needs them and forwarding them would leak
-# gateway auth/plumbing material (Plan §16.2).
+# Gateway-specific headers that must not reach the editor.
 GATEWAY_REQUEST_HEADER_BLOCKLIST: frozenset[str] = frozenset(
     {
         "x-csrf-token",
     }
 )
 
-# Gateway session cookie name(s). Upstream editor cookies are preserved;
-# only the gateway's own auth cookie is stripped (Plan §16.2).
 GATEWAY_COOKIE_NAMES: frozenset[str] = frozenset({"gateway_session"})
 
 
@@ -109,7 +105,7 @@ class ProxyAdapter:
 
         Drops hop-by-hop headers, gateway-only headers, and the gateway
         auth cookie from the ``Cookie`` header. Other cookies (editor
-        cookies etc.) are preserved (Plan §16.2).
+        cookies etc.) are preserved.
         """
         out: list[tuple[str, str]] = []
         # Starlette's ``Headers.items()`` returns each repeated header as
@@ -194,12 +190,7 @@ class ProxyAdapter:
         forwarded.append(("x-forwarded-host", request.headers.get("host", "")))
         forwarded.append(("x-forwarded-prefix", f"/editor/{session_id}"))
 
-        # Stream the downstream request body straight into the upstream
-        # request (Plan §16.2). httpx wraps the async generator in an
-        # ``AsyncIteratorByteStream`` and emits a chunked
-        # ``Transfer-Encoding`` header because the total length is
-        # unknown, so large uploads are forwarded without an in-memory
-        # copy on the gateway side.
+        # Stream uploads without buffering them in the gateway.
         req = self._http.build_request(
             method=method,
             url=upstream_url,
@@ -225,12 +216,7 @@ class ProxyAdapter:
         )
         content_type = upstream_resp.headers.get("content-type")
 
-        # A guaranteed background finalizer releases the upstream
-        # connection back to the pool even if the downstream client
-        # disconnects mid-stream before the body iterator is fully
-        # consumed (Plan §16.2; HI-06). ``aclose`` is idempotent in
-        # httpx, so the belt-and-suspenders close inside the body
-        # iterator (for graceful completion) is safe alongside this.
+        # Release the upstream connection if the downstream disconnects.
         background = BackgroundTask(_aclose_response, upstream_resp)
 
         response = StreamingResponse(
@@ -302,10 +288,7 @@ class ProxyAdapter:
             headers=upstream_headers,
         )
 
-        # Increment presence only after authorization and successful
-        # upstream connection + downstream accept (plan §16.3 step 8).
-        # The matching decrement is performed by the route handler in its
-        # ``finally`` block, exactly once.
+        # Presence begins only after both WebSocket handshakes succeed.
         if self._session_service is not None:
             self._session_service.on_client_connected(session_id)
 
@@ -358,8 +341,7 @@ class ProxyAdapter:
 
 
 async def _iter_upstream(resp: httpx.Response) -> AsyncIterator[bytes]:
-    """Yield upstream response bytes lazily, releasing the upstream on
-    graceful exhaustion (Plan §16.2; HI-06)."""
+    """Yield response bytes and release the upstream connection."""
     try:
         async for chunk in resp.aiter_bytes():
             yield chunk

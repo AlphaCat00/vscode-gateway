@@ -5,18 +5,30 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=vscode-gateway
-Group=vscode-gateway
+User=nobody
 WorkingDirectory=/opt/vscode-gateway
-ExecStart=/opt/vscode-gateway/.venv/bin/uv run uvicorn vscode_gateway.app:create_app --factory --workers 1 --host 127.0.0.1 --port 8000
+ExecStart=/usr/bin/env \
+    VSC_GATEWAY_STATE_DIR=/var/lib/vscode-gateway \
+    VSC_GATEWAY_RUNTIME_DIR=/var/cache/vscode-gateway \
+    VSC_GATEWAY_PASSWORD_HASH_PATH=/var/lib/vscode-gateway/password.hash \
+    VSC_GATEWAY_SESSION_SECRET_PATH=/var/lib/vscode-gateway/session.secret \
+    VSC_GATEWAY_SSH_DIR=/var/lib/vscode-gateway/ssh \
+    VSC_GATEWAY_SSH_CONFIG_PATH=/var/lib/vscode-gateway/ssh/config \
+    VSC_GATEWAY_SSH_KNOWN_HOSTS_PATH=/var/lib/vscode-gateway/ssh/known_hosts \
+    VSC_GATEWAY_SSH_KEYS_DIR=/var/lib/vscode-gateway/ssh/keys \
+    /opt/vscode-gateway/.venv/bin/uvicorn vscode_gateway.app:create_app --factory --workers 1 --host 127.0.0.1 --port 8000
 Restart=on-failure
 RestartSec=5
 EnvironmentFile=/opt/vscode-gateway/.env
+StateDirectory=vscode-gateway
+StateDirectoryMode=0700
+CacheDirectory=vscode-gateway
+CacheDirectoryMode=0700
+UMask=0077
 PrivateTmp=yes
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/opt/vscode-gateway/state /opt/vscode-gateway/config /opt/vscode-gateway/runtime
 
 [Install]
 WantedBy=multi-user.target
