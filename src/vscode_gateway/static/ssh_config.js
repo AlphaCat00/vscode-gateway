@@ -78,6 +78,9 @@ async function fetchJSON(url, options = {}) {
             ...(options.headers || {}),
         },
     });
+    if (resp.status === 401) {
+        window.location.replace("/login");
+    }
     if (resp.status === 204) return null;
     const ok = typeof resp.ok === "boolean"
         ? resp.ok

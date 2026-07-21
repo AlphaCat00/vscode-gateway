@@ -185,6 +185,70 @@ async def test_key_routes_keep_fixed_slots_and_multipart_contract(tmp_path: Path
 
 
 @pytest.mark.asyncio
+async def test_unauthenticated_pages_redirect_and_api_stays_unauthorized(
+    tmp_path: Path,
+) -> None:
+    settings = make_settings(tmp_path)
+    async with migrated_database(tmp_path) as database:
+        app, upstream_client = await _route_app(database, settings)
+        try:
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://testserver",
+                follow_redirects=False,
+            ) as client:
+                for path in ("/", "/settings/ssh", "/settings/keys"):
+                    response = await client.get(path)
+                    assert response.status_code == 303
+                    assert response.headers["location"] == "/login"
+
+                api_response = await client.get("/api/sessions")
+                assert api_response.status_code == 401
+        finally:
+            await upstream_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_generation_mismatch_redirects_page_and_clears_session(
+    tmp_path: Path,
+) -> None:
+    settings = make_settings(tmp_path)
+    settings.password_hash_path.write_text(hash_password("password"), encoding="utf-8")
+    async with migrated_database(tmp_path) as database:
+        app, upstream_client = await _route_app(database, settings)
+        try:
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://testserver",
+                follow_redirects=False,
+            ) as client:
+                login_page = await client.get("/login")
+                login_csrf = re.search(r'name="csrf_token" value="([^"]+)"', login_page.text)
+                assert login_csrf is not None
+                login = await client.post(
+                    "/login",
+                    data={"password": "password", "csrf_token": login_csrf.group(1)},
+                )
+                assert login.status_code == 303
+                assert (await client.get("/")).status_code == 200
+
+                generation_path = settings.state_dir / "session.generation"
+                generation_path.write_text(
+                    str(int(generation_path.read_text(encoding="utf-8")) + 1),
+                    encoding="utf-8",
+                )
+
+                page = await client.get("/")
+                assert page.status_code == 303
+                assert page.headers["location"] == "/login"
+                assert (await client.get("/api/sessions")).status_code == 401
+        finally:
+            await upstream_client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_session_host_key_and_trust_routes_serialize_and_clear_challenge(
     tmp_path: Path,
 ) -> None:

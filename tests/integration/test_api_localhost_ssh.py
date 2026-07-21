@@ -445,6 +445,11 @@ async def test_api_session_lifecycle_over_real_localhost_ssh(gateway_api: Gatewa
     assert ready.status_code == 200
     assert ready.json()["phase"] == "ready"
 
+    for page_path in ("/", "/settings/ssh", "/settings/keys"):
+        page_redirect = await client.get(page_path)
+        assert page_redirect.status_code == 303
+        assert page_redirect.headers["location"] == "/login"
+
     unauthorized = await client.get("/api/sessions")
     assert unauthorized.status_code == 401
     assert unauthorized.headers["content-type"].startswith("application/problem+json")

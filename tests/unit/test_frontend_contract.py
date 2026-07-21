@@ -44,3 +44,16 @@ def test_dashboard_script_keeps_existing_actions_and_page_links() -> None:
     assert "`/api/sessions/${encodeURIComponent(alias)}/retry`" in script
     assert 'configLink.href = "/settings/ssh"' in script
     assert 'keysLink.href = "/settings/keys"' in script
+
+
+def test_page_request_helpers_redirect_expired_sessions() -> None:
+    contracts = (
+        ("dashboard.js", "fetchJSON", "response"),
+        ("keys.js", "apiRequest", "response"),
+        ("ssh_config.js", "fetchJSON", "resp"),
+    )
+    for filename, helper, response_name in contracts:
+        script = _asset("static", filename)
+        assert f"async function {helper}" in script
+        assert f"{response_name}.status === 401" in script
+        assert 'window.location.replace("/login")' in script

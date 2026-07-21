@@ -80,6 +80,9 @@ async function apiRequest(url, options = {}) {
     }
 
     const response = await fetch(url, { ...options, headers });
+    if (response.status === 401) {
+        window.location.replace("/login");
+    }
     let payload = null;
     if (response.status !== 204) {
         const raw = await response.text();

@@ -76,6 +76,9 @@ async function fetchJSON(url, options = {}) {
         const message = err instanceof Error ? err.message : "Network request failed";
         throw new Error(`Network request failed: ${message}`);
     }
+    if (response.status === 401) {
+        window.location.replace("/login");
+    }
 
     let payload = null;
     const contentType = response.headers

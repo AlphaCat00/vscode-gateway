@@ -69,6 +69,17 @@ async def require_auth(request: Request) -> None:
         raise HTTPException(status_code=401, detail="Session no longer valid")
 
 
+async def require_page_auth(request: Request) -> Response | None:
+    """Redirect unauthenticated browser page requests to the login page."""
+    try:
+        await require_auth(request)
+    except HTTPException as exc:
+        if exc.status_code != 401:
+            raise
+        return RedirectResponse(url="/login", status_code=303)
+    return None
+
+
 async def require_csrf(request: Request) -> None:
     if not verify_csrf(request):
         raise HTTPException(status_code=403, detail="Invalid CSRF token")
@@ -193,8 +204,11 @@ def create_routes(
         return RedirectResponse(url="/login", status_code=303)
 
     # --- Dashboard ---
-    @router.get("/", dependencies=[Depends(require_auth)])
-    async def dashboard(request: Request) -> HTMLResponse:
+    @router.get("/")
+    async def dashboard(request: Request) -> Response:
+        redirect = await require_page_auth(request)
+        if redirect is not None:
+            return redirect
         template = templates.get_template("dashboard.html")
         csrf = get_csrf_token(request)
         return HTMLResponse(
@@ -313,8 +327,11 @@ def create_routes(
             return _problem(exc, str(uuid.uuid4()))
 
     # --- SSH Config routes ---
-    @router.get("/settings/ssh", dependencies=[Depends(require_auth)])
-    async def ssh_config_page(request: Request) -> HTMLResponse:
+    @router.get("/settings/ssh")
+    async def ssh_config_page(request: Request) -> Response:
+        redirect = await require_page_auth(request)
+        if redirect is not None:
+            return redirect
         template = templates.get_template("ssh_config.html")
         csrf = get_csrf_token(request)
         config_text = ""
@@ -385,8 +402,11 @@ def create_routes(
         )
 
     # --- SSH Keys routes ---
-    @router.get("/settings/keys", dependencies=[Depends(require_auth)])
-    async def ssh_keys_page(request: Request) -> HTMLResponse:
+    @router.get("/settings/keys")
+    async def ssh_keys_page(request: Request) -> Response:
+        redirect = await require_page_auth(request)
+        if redirect is not None:
+            return redirect
         template = templates.get_template("keys.html")
         csrf = get_csrf_token(request)
         return HTMLResponse(template.render(csrf_token=csrf, request=request))

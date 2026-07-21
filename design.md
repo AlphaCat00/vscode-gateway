@@ -57,6 +57,8 @@ The gateway has one password hash in `password.hash`. A signed session cookie au
 
 All state-changing routes require authentication and a CSRF token. WebSocket upgrades require authentication and an exact `Origin` match with `canonical_origin`. Host validation, trusted proxy handling, secure-cookie settings, and maximum session age are configurable.
 
+Unauthenticated or generation-invalid browser navigation to `/`, `/settings/ssh`, and `/settings/keys` redirects to `/login`; API requests retain problem+json 401 responses.
+
 API failures produced from `GatewayError` use `application/problem+json` and include a stable `code` plus a request ID.
 
 ## SSH Configuration And Catalog
