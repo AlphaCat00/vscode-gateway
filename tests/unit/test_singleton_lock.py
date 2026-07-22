@@ -225,6 +225,34 @@ def test_lifespan_does_not_release_lock_prematurely_on_inner_error(
     asyncio.run(_drive())
 
 
+def test_lifespan_skips_recovery_when_ssh_config_is_invalid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    settings.ssh_config_path.write_text(
+        "Host target\n    HostName target.example.test\nMatch exec touch /tmp/unsafe\n",
+        encoding="utf-8",
+    )
+    app = _build_app(settings)
+    recovery_called = False
+
+    async def _fail_if_recovered(self: Any) -> Any:
+        nonlocal recovery_called
+        recovery_called = True
+        raise AssertionError("recovery must not parse a rejected SSH config")
+
+    monkeypatch.setattr("vscode_gateway.sessions.SessionService.recover_all", _fail_if_recovered)
+
+    async def _drive() -> None:
+        async with lifespan(app):
+            readiness: Readiness = app.state.readiness  # type: ignore[assignment]
+            assert readiness.phase == ReadinessPhase.DEGRADED
+            assert "ssh config is invalid" in readiness.snapshot().reason.lower()
+            assert recovery_called is False
+
+    asyncio.run(_drive())
+
+
 # ---------------------------------------------------------------------------
 # Multi-worker env-var belt-and-suspenders check
 # ---------------------------------------------------------------------------

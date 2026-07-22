@@ -28,6 +28,11 @@ uv run uvicorn vscode_gateway.app:create_app --factory --workers 1
 
 One process, one origin, one SQLite file. Workspaces are SSH config `Host` aliases.
 OpenVSCode runs folderless, loopback-only, behind a same-origin proxy at `/editor/{session_id}/...`.
+Configured `ProxyJump` routes are expanded and opened explicitly by `SshConnectionService`.
+Every hop uses uploaded keys and gateway-owned `known_hosts`, captures host-key challenges,
+disables ambient authentication, and is owned and cleaned up with the session. Unknown jump and
+target keys can require sequential Trust/Retry steps; nested and multi-hop routes reject malformed
+endpoints, cycles, and excessive depth.
 
 ## Development
 

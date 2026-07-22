@@ -11,6 +11,7 @@ from tests.unit.ssh_backend_test_helpers import make_settings
 from vscode_gateway.errors import ErrorCode, GatewayError
 from vscode_gateway.settings import Settings
 from vscode_gateway.ssh_config import (
+    SshCatalog,
     compute_config_revision,
     discover_aliases,
     find_unsafe_directives,
@@ -26,6 +27,25 @@ Host production
     RemoteCommand cd /workspace
 """
 
+    assert find_unsafe_directives(config) == []
+
+
+def test_proxy_command_equals_syntax_is_rejected_case_insensitively() -> None:
+    config = "\t pRoXyCoMmAnD=ssh gateway %h\n"
+
+    assert find_unsafe_directives(config) == ["proxycommand"]
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        "ProxyCommands=ssh gateway %h\n",
+        "HostName ProxyCommand=ssh gateway %h\n",
+        "# ProxyCommand=ssh gateway %h\n",
+        "  # ProxyCommand=ssh gateway %h\n",
+    ],
+)
+def test_proxy_command_prefixes_values_and_comments_are_harmless(config: str) -> None:
     assert find_unsafe_directives(config) == []
 
 
@@ -136,3 +156,58 @@ async def test_failed_atomic_replace_cleans_temporary_file(
 
     assert settings.ssh_config_path.read_text(encoding="utf-8") == original
     assert list(settings.ssh_config_path.parent.glob(".cfg.*.tmp")) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "config",
+    [
+        "Host visible\n    HostName visible.example.test\n\x00",
+        "Host visible\n    ProxyCommand=ssh gateway %h\n",
+        "x" * 1_000_001,
+        "\n" * 10_001,
+        "\n".join(f"Host alias-{index}" for index in range(1_002)),
+    ],
+)
+async def test_catalog_does_not_publish_aliases_from_invalid_config(
+    tmp_path: Path, config: str
+) -> None:
+    settings = make_settings(tmp_path)
+    settings.ssh_config_path.parent.mkdir(parents=True, exist_ok=True)
+    settings.ssh_config_path.write_text(config, encoding="utf-8")
+
+    snapshot = await SshCatalog(settings).refresh()
+
+    assert snapshot.aliases == ()
+    assert snapshot.error
+
+
+@pytest.mark.asyncio
+async def test_catalog_does_not_publish_aliases_from_invalid_utf8_config(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    settings.ssh_config_path.parent.mkdir(parents=True, exist_ok=True)
+    settings.ssh_config_path.write_bytes(b"Host visible\n\xff\n")
+
+    snapshot = await SshCatalog(settings).refresh()
+
+    assert snapshot.aliases == ()
+    assert snapshot.error
+
+
+@pytest.mark.asyncio
+async def test_catalog_publishes_aliases_with_proxy_jump(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    settings.ssh_config_path.parent.mkdir(parents=True, exist_ok=True)
+    settings.ssh_config_path.write_text(
+        "Host target\n"
+        "    HostName target.example.test\n"
+        "    ProxyJump jump\n"
+        "Host jump\n"
+        "    HostName jump.example.test\n",
+        encoding="utf-8",
+    )
+
+    snapshot = await SshCatalog(settings).refresh()
+
+    assert snapshot.error is None
+    assert snapshot.aliases == ("jump", "target")

@@ -37,12 +37,14 @@ The backend key and host-trust APIs have been redesigned, while the checked-in k
 ## SSH rules
 
 - Gateway-owned SSH state is under `state_dir/ssh`: `config`, `known_hosts`, and `keys/`
-- Only uploaded Ed25519, ECDSA, and RSA keys authenticate target hosts; ambient keys, agents, and password methods are disabled
+- Only uploaded Ed25519, ECDSA, and RSA keys authenticate target and jump hosts; ambient keys, agents, and password methods are disabled
 - Unknown and changed host keys require an exact persisted challenge and explicit trust request
 - Remote command argv is encoded with `shlex.join()` and passed to AsyncSSH as one command string with byte output
 - Use AsyncSSH SFTP and forwarding APIs; never invoke a local shell or system SSH tool
-- Native AsyncSSH `ProxyJump` is intentionally retained for now and is a documented limitation: jump connections do not receive all explicit target key/trust options
-- The service runs as `nobody` to constrain ambient SSH state available to native jump handling
+- `ProxyJump` routes are expanded and opened explicitly by `SshConnectionService`; uploaded keys, gateway-owned `known_hosts`, host-key challenge capture, and disabled ambient authentication apply to every hop
+- Jump connections are owned with the target and cleaned up in reverse order; unknown jump and target keys can require sequential trust and retry
+- Nested and multi-hop routes reject malformed endpoints, cycles, and excessive depth
+- The service runs as `nobody` as defense in depth alongside the explicit SSH policy
 
 ## Data and lifecycle rules
 
@@ -79,6 +81,4 @@ The backend key and host-trust APIs have been redesigned, while the checked-in k
 ## Current priorities
 
 - Preserve the completed AsyncSSH backend and session cleanup/recovery guarantees
-- Harden native jump-host identity and trust handling before claiming parity with direct targets
-- Extend integration coverage to jump hosts, proxied WebSockets, and browser behavior when that work is explicitly in scope
 - Keep `design.md` synchronized with implemented behavior and known limitations

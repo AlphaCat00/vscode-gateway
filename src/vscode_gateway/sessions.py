@@ -138,7 +138,7 @@ class SessionService:
                         session_id=str(session_id),
                         error=error,
                     )
-            error = await self._close_connection(tunnel.ssh_conn.conn)
+            error = await self._close_ssh_connection(tunnel.ssh_conn)
             if error is not None:
                 logger.warning(
                     "shutdown_connection_close_failed",
@@ -266,7 +266,6 @@ class SessionService:
             ssh_conn = await self._connection_service.connect_for_session(
                 session_id=session_id,
                 alias=alias,
-                role="target",
             )
             ledger.ssh_conn = ssh_conn
 
@@ -380,6 +379,15 @@ class SessionService:
             return f"SSH connection close error: {exc}"
         return None
 
+    async def _close_ssh_connection(self, ssh_conn: SshConnection) -> str | None:
+        """Close the target and every jump connection in reverse order."""
+        errors: list[str] = []
+        for conn in reversed(ssh_conn.chain):
+            error = await self._close_connection(conn)
+            if error is not None:
+                errors.append(error)
+        return "; ".join(errors) if errors else None
+
     async def _finalize_open_read(
         self,
         session_id: SessionId,
@@ -445,7 +453,7 @@ class SessionService:
                 ledger.remote_started = False
 
         if ledger.ssh_conn is not None:
-            close_error = await self._close_connection(ledger.ssh_conn.conn)
+            close_error = await self._close_ssh_connection(ledger.ssh_conn)
             if close_error is not None:
                 logger.warning(
                     "open_cleanup_connection_close_failed",
@@ -556,7 +564,7 @@ class SessionService:
             errors.append(str(exc))
         finally:
             if ssh_conn is not None:
-                close_error = await self._close_connection(ssh_conn.conn)
+                close_error = await self._close_ssh_connection(ssh_conn)
                 if close_error is not None:
                     errors.append(close_error)
                     connection_close_failed = True
@@ -630,7 +638,7 @@ class SessionService:
         if ssh_conn is not None:
             return ssh_conn
         return await self._connection_service.connect_for_session(
-            session_id=session_id, alias=alias, role="target"
+            session_id=session_id, alias=alias
         )
 
     async def retry(self, alias: str) -> SessionView:
@@ -692,13 +700,13 @@ class SessionService:
                 try:
                     if record.state in (SessionState.STARTING, SessionState.READY):
                         ssh_conn = await self._connection_service.connect_for_session(
-                            session_id=record.id, alias=record.alias, role="target"
+                            session_id=record.id, alias=record.alias
                         )
                         insp = await self._runtime.inspect_session(ssh_conn.conn, record.id)
                         if insp["running"] is False:
                             if record.state == SessionState.STARTING:
                                 await self._runtime.remove_session(ssh_conn.conn, record.id)
-                                close_error = await self._close_connection(ssh_conn.conn)
+                                close_error = await self._close_ssh_connection(ssh_conn)
                                 if close_error is not None:
                                     raise GatewayError(
                                         ErrorCode.RECOVERY_FAILED,
@@ -778,12 +786,12 @@ class SessionService:
 
                     elif record.state == SessionState.ERROR:
                         ssh_conn = await self._connection_service.connect_for_session(
-                            session_id=record.id, alias=record.alias, role="target"
+                            session_id=record.id, alias=record.alias
                         )
                         insp = await self._runtime.inspect_session(ssh_conn.conn, record.id)
                         if insp["running"] is False:
                             await self._runtime.remove_session(ssh_conn.conn, record.id)
-                            close_error = await self._close_connection(ssh_conn.conn)
+                            close_error = await self._close_ssh_connection(ssh_conn)
                             if close_error is not None:
                                 raise GatewayError(
                                     ErrorCode.RECOVERY_FAILED,
@@ -819,7 +827,7 @@ class SessionService:
                             with suppress(Exception):
                                 await clear_tunnel_identity(self._db, str(record.id))
                         if ssh_conn is not None:
-                            close_error = await self._close_connection(ssh_conn.conn)
+                            close_error = await self._close_ssh_connection(ssh_conn)
                             if close_error is not None:
                                 self._tunnels[record.id] = _SessionTunnel(
                                     ssh_conn=ssh_conn,
@@ -1047,7 +1055,7 @@ class SessionService:
         if ssh_conn is not None:
             with suppress(Exception):
                 await self._runtime.stop_session(ssh_conn.conn, session_id)
-            close_error = await self._close_connection(ssh_conn.conn)
+            close_error = await self._close_ssh_connection(ssh_conn)
             if close_error is not None:
                 logger.warning(
                     "tunnel_exit_connection_close_failed",

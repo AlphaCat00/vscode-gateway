@@ -16,7 +16,7 @@ The implementation is intentionally a single Python process with one SQLite data
 - Argon2 single-user password authentication
 - structlog for structured logging
 
-The systemd service runs as `nobody`. This limits ambient user SSH configuration and credentials available to AsyncSSH, especially when it resolves native `ProxyJump` connections.
+The systemd service runs as `nobody` as defense in depth alongside the explicit SSH policy.
 
 ## Local State
 
@@ -75,6 +75,8 @@ Config writes:
 - reject directives which can execute local programs, establish unmanaged forwards, or override gateway-owned identity and trust
 - atomically replace the config and refresh the in-memory catalog
 
+Startup applies the same content limits and prohibited-directive checks before publishing the catalog. An invalid externally provisioned config publishes no aliases, skips SSH recovery so AsyncSSH never parses it, and leaves readiness degraded until the file is corrected and the service is restarted.
+
 Alias discovery is deliberately lightweight. AsyncSSH remains the authority when it resolves a selected alias and applies supported SSH config directives.
 
 ## Uploaded Keys
@@ -89,21 +91,21 @@ There can be at most one key per slot. Uploads are classified from parsed key ma
 
 Uploads and deletions are serialized by an in-process lock. Replacing a key requires deleting the existing slot first. The current file-and-database update is not a cross-resource crash-atomic transaction.
 
-Target connections explicitly disable password, keyboard-interactive, host-based, GSSAPI, agent, and default-key authentication. At least one uploaded key is required.
+Every hop explicitly disables password, keyboard-interactive, host-based, GSSAPI, agent, and default-key authentication. At least one uploaded key is required.
 
 ## Host Trust
 
-All target connections use `state/ssh/known_hosts`. Unknown or changed host keys are rejected, captured, and stored as a pending challenge containing the alias, host, port, algorithm, fingerprint, and full public key.
+All target and jump connections use `state/ssh/known_hosts`. Unknown or changed host keys are rejected, captured, and stored as a pending challenge containing the alias, host, port, algorithm, fingerprint, and full public key.
 
 The session enters `error` with `ssh_host_unknown` or `ssh_host_changed`. A trust request must exactly match the pending challenge. Changed keys additionally require `replace=true`. Non-default ports use the OpenSSH `[host]:port` form.
 
-After trust is recorded, the client explicitly retries the session. Trust is never granted automatically.
+After trust is recorded, the client explicitly retries the session. A route may therefore require sequential trust and retry for an unknown jump key and then an unknown target key. Trust is never granted automatically.
 
 ## SSH Connections
 
-`SshConnectionService` owns AsyncSSH transport operations. A session uses one target connection for remote commands, SFTP, and local forwarding. Remote command arguments are converted with `shlex.join()` and passed as one command string; no local shell or system `ssh`, `scp`, or `ssh-keygen` process is used.
+`SshConnectionService` owns AsyncSSH transport operations and expands each configured `ProxyJump` route explicitly, opening the resulting chain one hop at a time. A session uses one target connection for remote commands, SFTP, and local forwarding, plus any explicitly opened jump connections. Every hop receives the uploaded keys, gateway-owned `state/ssh/known_hosts`, host-key challenge capture, and disabled ambient authentication policy. Unknown jump and target keys can therefore stop the chain in sequence, requiring trust and retry before the next hop is opened. Nested and multi-hop routes reject malformed endpoints, cycles, and excessive depth.
 
-Native AsyncSSH `ProxyJump` behavior is retained. Jump-host connections are created internally by AsyncSSH and do not currently receive the gateway's explicit uploaded-key and known-host options. Running the service as `nobody` reduces, but does not eliminate, that difference. This is a known security boundary to address before treating jump-host behavior as equivalent to direct target connections.
+The complete chain is owned by `SshConnection`; session cleanup and shutdown close the target and then the jumps in reverse order. Remote command arguments are converted with `shlex.join()` and passed as one command string; no local shell or system `ssh`, `scp`, or `ssh-keygen` process is used.
 
 ## Remote Runtime
 
@@ -190,7 +192,7 @@ Key upload is multipart form data with `name` and `private_key`. Trust requests 
 
 ## Browser Frontend
 
-The checked-in frontend is server-rendered and uses fixed Ed25519, RSA, and ECDSA key slots with one generic multipart upload form. The dashboard renders host-trust actions on workspace cards and retries the existing session after Trust or Replace; Cancel uses the existing session Close action. After normal cleanup reports `stop_failed`, the card offers Force close behind an explicit browser confirmation. The confirmation always warns about orphaning and is stronger when the API reports persisted remote identity. A changed-host response contains only the currently presented fingerprint, so the card explains that the previous fingerprint is unavailable. If a challenge is explicitly marked as a jump host, the card describes it defensively as a jump host used by the selected alias; native `ProxyJump` behavior remains subject to the backend limitation below.
+The checked-in frontend is server-rendered and uses fixed Ed25519, RSA, and ECDSA key slots with one generic multipart upload form. The dashboard renders host-trust actions on workspace cards and retries the existing session after Trust or Replace; Cancel uses the existing session Close action. After normal cleanup reports `stop_failed`, the card offers Force close behind an explicit browser confirmation. The confirmation always warns about orphaning and is stronger when the API reports persisted remote identity. A changed-host response contains only the currently presented fingerprint, so the card explains that the previous fingerprint is unavailable. If a challenge is explicitly marked as a jump host, the card describes it defensively as a jump host used by the selected alias; route handling is owned by the backend as described above.
 
 The SSH config page shows backend-authoritative config errors and adds best-effort client-side line hints for prohibited directives by inspecting the submitted text. The backend does not provide line metadata. Browser automation is not part of the current coverage.
 
@@ -211,16 +213,15 @@ uv run pyright
 uv run pytest
 ```
 
-Unit tests use fake AsyncSSH connections and service doubles. The API integration test launches an ephemeral OpenSSH `sshd` on localhost and exercises authentication, CSRF, SSH config publication, key upload, host trust, retry, real SSH negotiation, SFTP runtime installation, forwarding, HTTP proxying, close, and key deletion. Its default runtime archive contains a small synthetic editor so the normal suite remains fast and offline.
+Unit tests use fake AsyncSSH connections and service doubles, including explicit jump-route expansion, per-hop policy and host-key challenges, route validation, and reverse-order cleanup. API integration tests launch ephemeral OpenSSH `sshd` instances on localhost and exercise authentication, CSRF, SSH config publication, key upload, host trust, retry, real SSH negotiation, SFTP runtime installation, forwarding, HTTP proxying, close, key deletion, and sequential jump/target trust. Their default runtime archive contains a small synthetic editor so the normal suite remains fast and offline.
 
 The same integration lifecycle can run against a real OpenVSCode release with the `real_editor` marker. Set `VSC_GATEWAY_TEST_OPENVSCODE_ARCHIVE` to a local archive, or set both `VSC_GATEWAY_TEST_OPENVSCODE_URL` and `VSC_GATEWAY_TEST_OPENVSCODE_SHA256`. `VSC_GATEWAY_TEST_OPENVSCODE_VERSION` optionally controls the runtime version tag.
 
 ## Current Limitations
 
-- Native `ProxyJump` does not yet enforce the exact key and trust policy used for target connections.
 - SSH config validation is a defensive directive scanner and alias extractor, not a complete parser.
 - Key files and SQLite metadata cannot be committed atomically across a crash.
 - Remote helper and archive staging currently use predictable shared `/tmp` locations or `/tmp` staging paths.
 - Remote command output and SFTP operations do not yet have one uniform bounded-output and timeout policy.
 - The local forwarding port is selected before AsyncSSH binds it, leaving a small allocation race.
-- Automated coverage does not currently include jump hosts, proxied WebSockets, or browser behavior. Real OpenVSCode coverage is opt-in rather than part of the offline default suite.
+- Automated coverage does not currently include proxied WebSockets or browser behavior. Real OpenVSCode coverage is opt-in rather than part of the offline default suite.

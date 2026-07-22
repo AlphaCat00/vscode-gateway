@@ -105,7 +105,7 @@ async def lifespan(app: FastAPI):
         )
 
         catalog = SshCatalog(settings)
-        await catalog.refresh()
+        catalog_snapshot = await catalog.refresh()
 
         key_service = SshKeyService(settings, db)
         host_trust_service = HostTrustService(settings, db)
@@ -160,31 +160,37 @@ async def lifespan(app: FastAPI):
 
         logger.info("running_startup_recovery")
         await readiness.begin_recovery()
-        try:
-            report = await session_service.recover_all()
-            logger.info(
-                "startup_recovery_complete",
-                recovered=report.recovered,
-                failed=report.failed,
-                cleaned=report.cleaned,
-                error_sessions_remaining=report.error_sessions_remaining,
-                orphaned_resources_remaining=report.orphaned_resources_remaining,
+        if catalog_snapshot.error:
+            logger.error("startup_ssh_config_invalid", error=catalog_snapshot.error)
+            await readiness.mark_degraded(
+                f"SSH config is invalid: {catalog_snapshot.error}", UnresolvedCounts()
             )
-            unresolved = UnresolvedCounts(
-                error_sessions=report.error_sessions_remaining,
-                orphaned_resources=report.orphaned_resources_remaining,
-            )
-            if unresolved.error_sessions > 0 or unresolved.orphaned_resources > 0:
-                await readiness.mark_degraded("recovery left unresolved sessions", unresolved)
-                logger.warning(
-                    "startup_recovery_degraded",
-                    **unresolved.as_dict(),
+        else:
+            try:
+                report = await session_service.recover_all()
+                logger.info(
+                    "startup_recovery_complete",
+                    recovered=report.recovered,
+                    failed=report.failed,
+                    cleaned=report.cleaned,
+                    error_sessions_remaining=report.error_sessions_remaining,
+                    orphaned_resources_remaining=report.orphaned_resources_remaining,
                 )
-            else:
-                await readiness.mark_ready()
-        except Exception as exc:
-            logger.error("startup_recovery_failed", error=str(exc))
-            await readiness.mark_degraded(f"recovery failed: {exc}", UnresolvedCounts())
+                unresolved = UnresolvedCounts(
+                    error_sessions=report.error_sessions_remaining,
+                    orphaned_resources=report.orphaned_resources_remaining,
+                )
+                if unresolved.error_sessions > 0 or unresolved.orphaned_resources > 0:
+                    await readiness.mark_degraded("recovery left unresolved sessions", unresolved)
+                    logger.warning(
+                        "startup_recovery_degraded",
+                        **unresolved.as_dict(),
+                    )
+                else:
+                    await readiness.mark_ready()
+            except Exception as exc:
+                logger.error("startup_recovery_failed", error=str(exc))
+                await readiness.mark_degraded(f"recovery failed: {exc}", UnresolvedCounts())
     except Exception as exc:
         logger.error("startup_mandatory_failed", error=str(exc))
         await readiness.fail(f"mandatory startup failed: {exc}")

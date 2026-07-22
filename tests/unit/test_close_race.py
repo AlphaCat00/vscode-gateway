@@ -120,6 +120,23 @@ class _FakeConnectionHandle:
         self.waited = True
 
 
+class _OrderedConnectionHandle(_FakeConnectionHandle):
+    def __init__(self, name: str, close_order: list[str], *, fail_wait: bool = False) -> None:
+        super().__init__()
+        self.name = name
+        self.close_order = close_order
+        self.fail_wait = fail_wait
+
+    def close(self) -> None:
+        self.close_order.append(self.name)
+        super().close()
+
+    async def wait_closed(self) -> None:
+        self.waited = True
+        if self.fail_wait:
+            raise RuntimeError("synthetic close failure")
+
+
 class _FakeListener:
     def __init__(self) -> None:
         self.closed = False
@@ -308,6 +325,36 @@ async def test_shutdown_awaits_listener_and_connection_close(
     assert handle.closed is True
     assert handle.waited is True
     assert service._tunnels == {}
+
+
+async def test_shutdown_closes_target_then_jumps_in_reverse_order(
+    service: SessionService,
+) -> None:
+    sid = uuid.uuid4()
+    close_order: list[str] = []
+    jump_a = _OrderedConnectionHandle("jump-a", close_order)
+    jump_b = _OrderedConnectionHandle("jump-b", close_order, fail_wait=True)
+    target = _OrderedConnectionHandle("target", close_order)
+    ssh_conn = SshConnection(
+        conn=cast(asyncssh.SSHClientConnection, target),
+        listener=None,
+        local_port=0,
+        remote_port=0,
+        alias="host-a",
+        capturer=_HostKeyCapturer(),
+        connections=tuple(
+            cast(asyncssh.SSHClientConnection, connection)
+            for connection in (jump_a, jump_b, target)
+        ),
+    )
+    service._tunnels[sid] = sessions_mod._SessionTunnel(ssh_conn=ssh_conn)
+
+    await service.shutdown()
+
+    assert close_order == ["target", "jump-b", "jump-a"]
+    assert jump_a.waited is True
+    assert jump_b.waited is True
+    assert target.waited is True
 
 
 async def test_close_retains_connection_handle_when_wait_closed_fails(
