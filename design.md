@@ -51,6 +51,9 @@ SQLite contains:
 - `ssh_keys`: display metadata for the three key slots; private material remains on disk
 - `pending_host_keys`: the exact host-key challenge associated with a session
 
+Pending host-key rows reference their session with `ON DELETE CASCADE`, so deleting a
+session and its unresolved challenge is one SQLite transaction.
+
 ## Authentication And Request Security
 
 The gateway has one password hash in `password.hash`. A signed session cookie authenticates browser requests. Login attempts are throttled in memory.
@@ -118,7 +121,7 @@ For a new session the gateway:
 8. Creates an AsyncSSH local forward on gateway loopback.
 9. Verifies the proxied editor and changes the row to `ready`.
 
-Before signaling a process, the helper verifies the saved PID against boot ID, process start ID, and executable. Cleanup does not remove the durable row until remote absence has been confirmed.
+Before signaling a process, the helper verifies the saved PID against boot ID, process start ID, and executable. Normal cleanup does not remove the durable row until remote absence has been confirmed. A failed host-key or authentication attempt with no persisted remote or tunnel identity is known to precede remote startup and can be closed without reconnecting.
 
 ## Session Model
 
@@ -140,6 +143,8 @@ Concurrency rules:
 - owned connections, listeners, workers, watchers, and timers are closed or awaited during shutdown
 
 Startup recovery inspects durable sessions, reconnects to remote editors when identity remains valid, rebuilds local forwards, and restores disconnect timers. Sessions which cannot be recovered remain visible as errors until retry or successful cleanup.
+
+If normal cleanup cannot verify remote absence, an authenticated, CSRF-protected force close first attempts the same best-effort cleanup and then deletes the local row regardless of SSH or local resource-close errors. It also removes proxy and presence state and releases capacity. This can orphan a remote OpenVSCode process, never changes host trust, and logs the session ID plus whether persisted remote identity existed.
 
 ## Presence And Automatic Close
 
@@ -179,11 +184,13 @@ GET    /api/version
 WS     /editor/{session_id}/{path}
 ```
 
+`POST /api/sessions/{alias}/close?force=true` performs the explicit force-close behavior. Closing an already absent session is idempotent for both normal and force requests.
+
 Key upload is multipart form data with `name` and `private_key`. Trust requests submit the exact pending `alias`, `host`, `port`, and `publicKey`, plus `replace` for a changed key.
 
 ## Browser Frontend
 
-The checked-in frontend is server-rendered and uses fixed Ed25519, RSA, and ECDSA key slots with one generic multipart upload form. The dashboard renders host-trust actions on workspace cards and retries the existing session after Trust or Replace; Cancel uses the existing session Close action. A changed-host response contains only the currently presented fingerprint, so the card explains that the previous fingerprint is unavailable. If a challenge is explicitly marked as a jump host, the card describes it defensively as a jump host used by the selected alias; native `ProxyJump` behavior remains subject to the backend limitation below.
+The checked-in frontend is server-rendered and uses fixed Ed25519, RSA, and ECDSA key slots with one generic multipart upload form. The dashboard renders host-trust actions on workspace cards and retries the existing session after Trust or Replace; Cancel uses the existing session Close action. After normal cleanup reports `stop_failed`, the card offers Force close behind an explicit browser confirmation. The confirmation always warns about orphaning and is stronger when the API reports persisted remote identity. A changed-host response contains only the currently presented fingerprint, so the card explains that the previous fingerprint is unavailable. If a challenge is explicitly marked as a jump host, the card describes it defensively as a jump host used by the selected alias; native `ProxyJump` behavior remains subject to the backend limitation below.
 
 The SSH config page shows backend-authoritative config errors and adds best-effort client-side line hints for prohibited directives by inspecting the submitted text. The backend does not provide line metadata. Browser automation is not part of the current coverage.
 

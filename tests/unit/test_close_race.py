@@ -639,3 +639,143 @@ async def test_capacity_released_exactly_once_in_all_close_paths(
     assert state["stop_calls"] == [sid]
 
     assert task.cancelled() or task.done()
+
+
+async def test_close_host_key_failure_without_identities_does_not_reconnect(
+    service: SessionService,
+    settings: Settings,
+    db: aiosqlite.Connection,
+    connection_service: _FakeConnectionService,
+) -> None:
+    sid = uuid.uuid4()
+    record = SessionRecord(
+        id=sid,
+        alias="host-a",
+        state=SessionState.ERROR,
+        stage=SessionStage.STOP,
+        error_code=ErrorCode.SSH_HOST_UNKNOWN.value,
+        error_message="Trust required",
+    )
+    await insert_session(db, record)
+    service._capacity_acquire(sid)
+
+    trust_service = HostTrustService(settings, db)
+    await trust_service.record_challenge(
+        session_id=sid,
+        role="target",
+        alias="host-a",
+        host="host-a.example.test",
+        port=22,
+        algorithm="ssh-ed25519",
+        fingerprint="SHA256:pending",
+        public_key="ssh-ed25519 AAAApending",
+    )
+    known_hosts_before = settings.ssh_known_hosts_path.read_text(encoding="utf-8")
+
+    await service.close("host-a")
+    assert await _wait_for_capacity_release(service, sid)
+
+    assert await get_session(db, str(sid)) is None
+    assert await trust_service.get_challenge(sid) is None
+    assert connection_service.connections == []
+    assert settings.ssh_known_hosts_path.read_text(encoding="utf-8") == known_hosts_before
+
+
+async def test_force_close_unreachable_session_releases_all_local_state(
+    service: SessionService,
+    settings: Settings,
+    db: aiosqlite.Connection,
+    connection_service: _FakeConnectionService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sid = uuid.uuid4()
+    record = SessionRecord(
+        id=sid,
+        alias="host-a",
+        state=SessionState.ERROR,
+        stage=SessionStage.STOP,
+        remote_pid=4242,
+        remote_port=9876,
+        remote_boot_id="boot-abc",
+        remote_process_start_id="psid-xyz",
+        remote_executable="/opt/openvscode/node",
+        error_code=ErrorCode.STOP_FAILED.value,
+        error_message="Target unreachable",
+    )
+    await insert_session(db, record)
+    service._capacity_acquire(sid)
+    service._registry.add(sid, 54321)
+    service._connected_counts[sid] = 2
+    grace_timer = asyncio.create_task(asyncio.sleep(30))
+    service._grace_timers[sid] = grace_timer
+
+    trust_service = HostTrustService(settings, db)
+    await trust_service.record_challenge(
+        session_id=sid,
+        role="target",
+        alias="host-a",
+        host="host-a.example.test",
+        port=22,
+        algorithm="ssh-ed25519",
+        fingerprint="SHA256:pending",
+        public_key="ssh-ed25519 AAAApending",
+    )
+    known_hosts_before = settings.ssh_known_hosts_path.read_text(encoding="utf-8")
+
+    connect_attempts: list[SessionId] = []
+
+    async def _fail_connect(
+        *,
+        session_id: SessionId,
+        alias: str,
+        role: HostKeyRole = "target",
+    ) -> SshConnection:
+        del alias, role
+        connect_attempts.append(session_id)
+        raise GatewayError(ErrorCode.SSH_UNREACHABLE, "Target unreachable", status_code=502)
+
+    monkeypatch.setattr(connection_service, "connect_for_session", _fail_connect)
+
+    workspace = (await service.get_workspaces_full())[0]
+    assert workspace.can_force_close is True
+    assert workspace.has_remote_identity is True
+
+    warning_events: list[tuple[str, dict[str, object]]] = []
+
+    class _TestLogger:
+        def warning(self, event: str, **values: object) -> None:
+            warning_events.append((event, values))
+
+    monkeypatch.setattr(sessions_mod, "logger", _TestLogger())
+
+    await service.close("host-a", force=True)
+    await asyncio.sleep(0)
+
+    assert connect_attempts == [sid]
+    assert await get_session(db, str(sid)) is None
+    assert await trust_service.get_challenge(sid) is None
+    assert sid not in service._capacity_owned
+    assert service._registry.lookup(sid) is None
+    assert sid not in service._connected_counts
+    assert sid not in service._grace_timers
+    assert grace_timer.cancelled()
+    assert settings.ssh_known_hosts_path.read_text(encoding="utf-8") == known_hosts_before
+    assert warning_events == [
+        (
+            "session_force_closed",
+            {
+                "session_id": str(sid),
+                "persisted_remote_identity": True,
+                "remote_cleanup_confirmed": False,
+                "cleanup_error_count": 1,
+            },
+        )
+    ]
+
+    await service.close("host-a", force=True)
+    assert connect_attempts == [sid]
+
+    service.on_client_connected(sid)
+    service.on_client_disconnected(sid)
+    assert sid not in service._connected_counts
+    assert sid not in service._grace_timers

@@ -53,6 +53,14 @@ from vscode_gateway.ssh_connection import SshConnection, SshConnectionService
 
 logger = structlog.get_logger()
 _RESOURCE_CLOSE_TIMEOUT = 5.0
+_PRE_REMOTE_FAILURE_CODES = frozenset(
+    {
+        ErrorCode.SSH_NO_UPLOADED_KEYS.value,
+        ErrorCode.SSH_NO_UPLOADED_KEY_ACCEPTED.value,
+        ErrorCode.SSH_HOST_UNKNOWN.value,
+        ErrorCode.SSH_HOST_CHANGED.value,
+    }
+)
 
 
 @dataclass
@@ -467,6 +475,8 @@ class SessionService:
         self,
         alias: str,
         reason: CloseReason = CloseReason.USER_REQUESTED,
+        *,
+        force: bool = False,
     ) -> None:
         async with self._get_lock(alias):
             session = await get_session_by_alias(self._db, alias)
@@ -487,20 +497,27 @@ class SessionService:
 
             close_session = session
 
+            if force:
+                await self._do_close(close_session, force=True)
+                return
+
         self._spawn(self._do_close(close_session))
 
-    async def _do_close(self, session: SessionRecord) -> None:
+    async def _do_close(self, session: SessionRecord, *, force: bool = False) -> None:
         session_id = session.id
 
         fresh = await get_session(self._db, str(session_id))
         if fresh is None:
+            self._cancel_grace(session_id)
             self._capacity_release(session_id)
+            self._registry.remove(session_id)
             self._connected_counts.pop(session_id, None)
             return
 
         errors: list[str] = []
         remote_absent = False
         connection_close_failed = False
+        had_remote_identity = self._has_persisted_remote_identity(fresh)
 
         tunnel = self._tunnels.pop(session_id, None)
         ssh_conn: SshConnection | None = tunnel.ssh_conn if tunnel is not None else None
@@ -515,21 +532,24 @@ class SessionService:
                         await clear_tunnel_identity(self._db, str(session_id))
 
         try:
-            ssh_conn = await self._conn_for_remote(
-                session_id=session_id,
-                alias=fresh.alias,
-                ssh_conn=ssh_conn,
-            )
-            if fresh.remote_pid is not None:
-                await self._runtime.stop_session(ssh_conn.conn, session_id)
+            if self._can_close_without_remote_inspection(fresh):
                 remote_absent = True
             else:
-                inspection = await self._runtime.inspect_session(ssh_conn.conn, session_id)
-                if inspection["running"] is True:
+                ssh_conn = await self._conn_for_remote(
+                    session_id=session_id,
+                    alias=fresh.alias,
+                    ssh_conn=ssh_conn,
+                )
+                if fresh.remote_pid is not None:
                     await self._runtime.stop_session(ssh_conn.conn, session_id)
-                remote_absent = True
+                    remote_absent = True
+                else:
+                    inspection = await self._runtime.inspect_session(ssh_conn.conn, session_id)
+                    if inspection["running"] is True:
+                        await self._runtime.stop_session(ssh_conn.conn, session_id)
+                    remote_absent = True
 
-            await self._runtime.remove_session(ssh_conn.conn, session_id)
+                await self._runtime.remove_session(ssh_conn.conn, session_id)
         except GatewayError as exc:
             errors.append(exc.safe_message)
         except Exception as exc:
@@ -541,7 +561,7 @@ class SessionService:
                     errors.append(close_error)
                     connection_close_failed = True
 
-        if connection_close_failed and ssh_conn is not None:
+        if connection_close_failed and ssh_conn is not None and not force:
             self._tunnels[session_id] = _SessionTunnel(
                 ssh_conn=ssh_conn,
                 listener=None,
@@ -553,7 +573,7 @@ class SessionService:
             except Exception as exc:
                 errors.append(f"Failed to clear remote identity: {exc}")
 
-        if errors or not remote_absent:
+        if not force and (errors or not remote_absent):
             message = "; ".join(errors) if errors else "Remote process absence was not confirmed"
             await mark_error(
                 self._db,
@@ -565,9 +585,39 @@ class SessionService:
             return
 
         await delete_session(self._db, str(session_id))
+        self._cancel_grace(session_id)
         self._capacity_release(session_id)
-
+        self._registry.remove(session_id)
         self._connected_counts.pop(session_id, None)
+
+        if force:
+            logger.warning(
+                "session_force_closed",
+                session_id=str(session_id),
+                persisted_remote_identity=had_remote_identity,
+                remote_cleanup_confirmed=remote_absent,
+                cleanup_error_count=len(errors),
+            )
+
+    @staticmethod
+    def _has_persisted_remote_identity(session: SessionRecord) -> bool:
+        return any(
+            value is not None
+            for value in (
+                session.remote_pid,
+                session.remote_port,
+                session.remote_boot_id,
+                session.remote_process_start_id,
+                session.remote_executable,
+            )
+        )
+
+    @classmethod
+    def _can_close_without_remote_inspection(cls, session: SessionRecord) -> bool:
+        has_runtime_identity = cls._has_persisted_remote_identity(session) or any(
+            value is not None for value in (session.local_port, session.tunnel_pid)
+        )
+        return session.error_code in _PRE_REMOTE_FAILURE_CODES and not has_runtime_identity
 
     async def _conn_for_remote(
         self,
@@ -856,6 +906,9 @@ class SessionService:
                             SessionState.ERROR,
                         ),
                         can_retry=session.state == SessionState.ERROR,
+                        can_force_close=session.state == SessionState.ERROR
+                        and session.error_code == ErrorCode.STOP_FAILED.value,
+                        has_remote_identity=self._has_persisted_remote_identity(session),
                         catalog_missing=alias not in catalog_aliases,
                         ssh_host_key=challenges.get(session.id),
                     )
@@ -950,11 +1003,17 @@ class SessionService:
 
     # --- Presence / proxy callbacks ---
     def on_client_connected(self, session_id: SessionId) -> None:
+        if session_id not in self._capacity_owned:
+            return
         self._cancel_grace(session_id)
         self._connected_counts[session_id] = self._connected_counts.get(session_id, 0) + 1
         self._spawn(set_last_connected(self._db, str(session_id)))
 
     def on_client_disconnected(self, session_id: SessionId) -> None:
+        if session_id not in self._capacity_owned:
+            self._cancel_grace(session_id)
+            self._connected_counts.pop(session_id, None)
+            return
         count = self._connected_counts.get(session_id, 0)
         if count > 0:
             count -= 1

@@ -240,6 +240,8 @@ def create_routes(
                 "canOpen": ws.can_open,
                 "canClose": ws.can_close,
                 "canRetry": ws.can_retry,
+                "canForceClose": ws.can_force_close,
+                "hasRemoteIdentity": ws.has_remote_identity,
                 "catalogMissing": ws.catalog_missing,
             }
             if ws.ssh_host_key is not None:
@@ -297,11 +299,12 @@ def create_routes(
     async def close_session(
         request: Request,
         alias: str,
+        force: bool = False,
     ) -> Response:
         await require_auth.__call__(request)
         await require_csrf.__call__(request)
         try:
-            await session_service.close(alias)
+            await session_service.close(alias, force=force)
             return Response(status_code=204)
         except GatewayError as exc:
             return _problem(exc, str(uuid.uuid4()))

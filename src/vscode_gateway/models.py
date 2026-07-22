@@ -126,6 +126,8 @@ class WorkspaceView:
     can_open: bool = False
     can_close: bool = False
     can_retry: bool = False
+    can_force_close: bool = False
+    has_remote_identity: bool = False
     catalog_missing: bool = False
     ssh_host_key: HostKeyChallenge | None = None
 

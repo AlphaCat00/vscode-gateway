@@ -44,6 +44,11 @@ def test_dashboard_script_keeps_existing_actions_and_page_links() -> None:
     assert "`/api/sessions/${encodeURIComponent(alias)}/retry`" in script
     assert 'configLink.href = "/settings/ssh"' in script
     assert 'keysLink.href = "/settings/keys"' in script
+    assert '"close?force=true"' in script
+    assert '"canForceClose"' in script
+    assert "workspace.hasRemoteIdentity" in script
+    assert "window.confirm(warning)" in script
+    assert "may be orphaned" in script
 
 
 def test_page_request_helpers_redirect_expired_sessions() -> None:

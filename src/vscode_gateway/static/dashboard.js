@@ -525,6 +525,16 @@ function renderWorkspaces(workspaces) {
                 busy,
             );
         }
+        if (isAllowed(workspace, "canForceClose")) {
+            addActionButton(
+                actions,
+                "force-close-btn danger",
+                "Force close",
+                alias,
+                forceCloseSession,
+                busy,
+            );
+        }
 
         const editorUrl = safeEditorUrl(workspace.editorUrl);
         if (state === "ready" && editorUrl && !busy) {
@@ -565,6 +575,7 @@ async function runSessionAction(alias, action) {
         open: "canOpen",
         close: "canClose",
         retry: "canRetry",
+        forceClose: "canForceClose",
     }[action];
     if (!workspace || !capability || !isAllowed(workspace, capability)) return;
 
@@ -572,11 +583,19 @@ async function runSessionAction(alias, action) {
         open: "Opening…",
         close: "Closing…",
         retry: "Retrying…",
+        forceClose: "Force closing…",
     };
     const paths = {
         open: "open",
         close: "close",
         retry: "retry",
+        forceClose: "close?force=true",
+    };
+    const actionNames = {
+        open: "Open",
+        close: "Close",
+        retry: "Retry",
+        forceClose: "Force close",
     };
     pendingActions.set(alias, { label: labels[action] });
     actionFeedback.delete(alias);
@@ -589,7 +608,7 @@ async function runSessionAction(alias, action) {
         );
     } catch (err) {
         const message = actionFailureText(
-            action.charAt(0).toUpperCase() + action.slice(1),
+            actionNames[action],
             err,
         );
         actionFeedback.set(alias, message);
@@ -611,6 +630,18 @@ async function closeSession(alias) {
 
 async function retrySession(alias) {
     return runSessionAction(alias, "retry");
+}
+
+async function forceCloseSession(alias) {
+    const workspace = workspaceByAlias.get(alias);
+    if (!workspace || !isAllowed(workspace, "canForceClose")) return;
+
+    const warning = workspace.hasRemoteIdentity
+        ? `Force close ${alias}? A remote OpenVSCode process was previously created and may be orphaned if cleanup cannot connect. This removes the gateway's local session state without confirming that the remote process stopped.`
+        : `Force close ${alias}? Remote cleanup may be abandoned if the gateway cannot connect. An unrecorded remote OpenVSCode process could be orphaned. This removes the gateway's local session state.`;
+    if (!window.confirm(warning)) return;
+
+    return runSessionAction(alias, "forceClose");
 }
 
 async function trustHost(alias, replace) {

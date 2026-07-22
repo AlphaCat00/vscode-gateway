@@ -298,6 +298,8 @@ async def test_session_host_key_and_trust_routes_serialize_and_clear_challenge(
                     "fingerprint": "SHA256:route-challenge",
                     "publicKey": public_key,
                 }
+                assert workspace["canForceClose"] is False
+                assert workspace["hasRemoteIdentity"] is False
 
                 trusted = await client.post(
                     "/api/ssh/hosts/trust",
@@ -314,5 +316,66 @@ async def test_session_host_key_and_trust_routes_serialize_and_clear_challenge(
                 known_hosts = settings.ssh_known_hosts_path.read_text(encoding="utf-8")
                 assert f"production.example.test {public_key}" in known_hosts
                 assert await challenge_service.get_challenge(session_id) is None
+        finally:
+            await upstream_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_force_close_route_requires_auth_csrf_and_explicit_flag(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = make_settings(tmp_path)
+    settings.password_hash_path.write_text(hash_password("password"), encoding="utf-8")
+    calls: list[tuple[str, bool]] = []
+
+    async def _close(
+        self: SessionService,
+        alias: str,
+        reason: object | None = None,
+        *,
+        force: bool = False,
+    ) -> None:
+        del self, reason
+        calls.append((alias, force))
+
+    monkeypatch.setattr(SessionService, "close", _close)
+
+    async with migrated_database(tmp_path) as database:
+        app, upstream_client = await _route_app(database, settings)
+        try:
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://testserver"
+            ) as client:
+                unauthorized = await client.post("/api/sessions/production/close?force=true")
+                assert unauthorized.status_code == 401
+
+                login_page = await client.get("/login")
+                login_match = re.search(r'name="csrf_token" value="([^"]+)"', login_page.text)
+                assert login_match is not None
+                await client.post(
+                    "/login",
+                    data={"password": "password", "csrf_token": login_match.group(1)},
+                    follow_redirects=False,
+                )
+
+                forbidden = await client.post("/api/sessions/production/close?force=true")
+                assert forbidden.status_code == 403
+                assert calls == []
+
+                csrf = _csrf_from_html((await client.get("/")).text)
+                forced = await client.post(
+                    "/api/sessions/production/close?force=true",
+                    headers={"X-CSRF-Token": csrf},
+                )
+                normal = await client.post(
+                    "/api/sessions/production/close",
+                    headers={"X-CSRF-Token": csrf},
+                )
+
+                assert forced.status_code == 204
+                assert normal.status_code == 204
+                assert calls == [("production", True), ("production", False)]
         finally:
             await upstream_client.aclose()
