@@ -22,6 +22,7 @@ def test_key_page_and_script_keep_upload_contract() -> None:
     assert "Generate" not in template
     assert 'body.append("private_key", keyFile)' in script
     assert 'apiRequest("/api/ssh/keys", { method: "POST", body })' in script
+    assert 'renderKeys(data.keys);\n        if (announce) setStatus("");' in script
 
 
 def test_config_page_and_script_keep_guidance_and_revision_contract() -> None:

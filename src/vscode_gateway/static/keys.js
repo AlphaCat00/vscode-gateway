@@ -240,6 +240,7 @@ async function loadKeys({ announce = true, allowBusy = false } = {}) {
             throw new Error("The server returned an invalid key inventory.");
         }
         renderKeys(data.keys);
+        if (announce) setStatus("");
         return true;
     } catch (error) {
         renderUnavailableSlots();
