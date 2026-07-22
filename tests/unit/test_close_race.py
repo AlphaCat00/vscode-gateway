@@ -152,6 +152,17 @@ class _FakeListener:
         self.waited = True
 
 
+class _ConnectionBoundListener(_FakeListener):
+    def __init__(self, connection: _FakeConnectionHandle) -> None:
+        super().__init__()
+        self.connection = connection
+
+    async def wait_closed(self) -> None:
+        if not self.connection.closed:
+            raise RuntimeError("active forwards remain until the SSH connection closes")
+        await super().wait_closed()
+
+
 class _FakeConnectionService(SshConnectionService):
     def __init__(self) -> None:
         self.connections: list[SshConnection] = []
@@ -605,7 +616,8 @@ async def test_close_ready_session_stops_remote_and_tunnel(
     await set_tunnel_identity(db, str(sid), 54321, 99999)
     service._capacity_acquire(sid)
     ssh_conn = await connection_service.connect_for_session(session_id=sid, alias="host-a")
-    listener = _FakeListener()
+    handle = cast(_FakeConnectionHandle, ssh_conn.conn)
+    listener = _ConnectionBoundListener(handle)
     service._tunnels[sid] = sessions_mod._SessionTunnel(
         ssh_conn=ssh_conn,
         listener=cast(asyncssh.SSHListener, listener),
@@ -620,6 +632,8 @@ async def test_close_ready_session_stops_remote_and_tunnel(
     assert await get_session(db, str(sid)) is None
     assert service._capacity_owned == set()
     assert listener.closed is True
+    assert listener.waited is True
+    assert handle.closed is True
     assert state["stop_calls"] == [sid]
     assert state["remove_calls"] == [sid]
     assert service._tunnels.get(sid) is None

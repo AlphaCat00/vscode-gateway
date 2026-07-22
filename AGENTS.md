@@ -52,7 +52,7 @@ The backend key and host-trust APIs have been redesigned, while the checked-in k
 - Use compare-and-set updates for expected session state transitions
 - Keep state changes and resource identity updates transactionally consistent when they are in SQLite
 - Do not delete a session row until remote process absence has been confirmed
-- Verify PID, boot ID, process start ID, and executable before signaling a remote process
+- Start OpenVSCode in a dedicated process group; verify PID, boot ID, process start ID, executable, and process group before signaling the complete group
 - Per-session connections, listeners, workers, watchers, and timers are owned and drained by `SessionService`
 - Lifespan owns startup recovery, task supervision, and shutdown; do not add an external background worker
 - State-changing routes require CSRF protection and authentication

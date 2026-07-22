@@ -168,6 +168,31 @@ def _same_process(pid: int, expected_start_id: str) -> bool:
     return len(fields) > 21 and fields[21] == expected_start_id
 
 
+def _matching_process_ids(command_fragment: str) -> list[int]:
+    matches: list[int] = []
+    for proc_path in Path("/proc").iterdir():
+        if not proc_path.name.isdigit():
+            continue
+        try:
+            command = proc_path.joinpath("cmdline").read_bytes().replace(b"\x00", b" ")
+        except OSError:
+            continue
+        if command_fragment.encode("utf-8") in command:
+            matches.append(int(proc_path.name))
+    return matches
+
+
+async def _wait_for_process_absence(command_fragment: str) -> None:
+    deadline = asyncio.get_running_loop().time() + 5.0
+    while asyncio.get_running_loop().time() < deadline:
+        if not _matching_process_ids(command_fragment):
+            return
+        await asyncio.sleep(0.05)
+    pytest.fail(
+        f"processes still reference {command_fragment!r}: {_matching_process_ids(command_fragment)}"
+    )
+
+
 async def _stop_leftover_editors(remote_state_dir: Path) -> None:
     for pid_path in remote_state_dir.glob("sessions/*/pid"):
         start_path = pid_path.with_name("proc_start_id")
@@ -199,7 +224,7 @@ async def localhost_ssh_server(tmp_path: Path) -> AsyncIterator[LocalSshServer]:
         pytest.skip("OpenSSH sshd is required for localhost integration tests")
     if not Path("/run/sshd").is_dir():
         pytest.skip("OpenSSH privilege-separation directory /run/sshd is unavailable")
-    for command in ("pgrep", "sha256sum", "ss", "tar"):
+    for command in ("pgrep", "setsid", "sha256sum", "ss", "tar"):
         if shutil.which(command) is None:
             pytest.skip(f"remote helper dependency {command!r} is unavailable")
 
@@ -654,7 +679,9 @@ async def test_api_session_lifecycle_over_real_localhost_ssh(gateway_api: Gatewa
     session = await client.get(f"/api/sessions/{_ALIAS}")
     assert session.status_code == 200
     assert session.json()["state"] == "ready"
-    assert ssh.remote_state_dir.joinpath("sessions", session.json()["id"]).is_dir()
+    remote_session_id = cast(str, session.json()["id"])
+    assert ssh.remote_state_dir.joinpath("sessions", remote_session_id).is_dir()
+    assert _matching_process_ids(remote_session_id)
 
     closed = await client.post(
         f"/api/sessions/{_ALIAS}/close",
@@ -662,6 +689,7 @@ async def test_api_session_lifecycle_over_real_localhost_ssh(gateway_api: Gatewa
     )
     assert closed.status_code == 204
     await _wait_for_workspace_state(client, _ALIAS, "closed")
+    await _wait_for_process_absence(remote_session_id)
 
     deleted = await client.delete(
         "/api/ssh/keys/ed25519",

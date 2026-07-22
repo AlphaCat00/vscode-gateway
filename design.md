@@ -123,7 +123,7 @@ For a new session the gateway:
 8. Creates an AsyncSSH local forward on gateway loopback.
 9. Verifies the proxied editor and changes the row to `ready`.
 
-Before signaling a process, the helper verifies the saved PID against boot ID, process start ID, and executable. Normal cleanup does not remove the durable row until remote absence has been confirmed. A failed host-key or authentication attempt with no persisted remote or tunnel identity is known to precede remote startup and can be closed without reconnecting.
+OpenVSCode starts in a dedicated process group. Before signaling it, the helper verifies the saved PID against boot ID, process start ID, executable, and process-group identity, then terminates the complete group so the launch wrapper cannot leave `server-main.js` or its workers orphaned. Normal cleanup does not remove the durable row until remote absence has been confirmed. Local forwarding stops accepting before remote cleanup; the SSH connection is closed before waiting for active forwarded channels to drain. A failed host-key or authentication attempt with no persisted remote or tunnel identity is known to precede remote startup and can be closed without reconnecting.
 
 ## Session Model
 
@@ -213,7 +213,7 @@ uv run pyright
 uv run pytest
 ```
 
-Unit tests use fake AsyncSSH connections and service doubles, including explicit jump-route expansion, per-hop policy and host-key challenges, route validation, and reverse-order cleanup. API integration tests launch ephemeral OpenSSH `sshd` instances on localhost and exercise authentication, CSRF, SSH config publication, key upload, host trust, retry, real SSH negotiation, SFTP runtime installation, forwarding, HTTP proxying, close, key deletion, and sequential jump/target trust. Their default runtime archive contains a small synthetic editor so the normal suite remains fast and offline.
+Unit tests use fake AsyncSSH connections and service doubles, including explicit jump-route expansion, per-hop policy and host-key challenges, route validation, and reverse-order cleanup. API integration tests launch ephemeral OpenSSH `sshd` instances on localhost and exercise authentication, CSRF, SSH config publication, key upload, host trust, retry, real SSH negotiation, SFTP runtime installation, forwarding, HTTP proxying, close, key deletion, and sequential jump/target trust. Their default runtime archive contains a small synthetic editor so the normal suite remains fast and offline. The real-editor case also verifies that API close leaves no process whose command references the closed session ID.
 
 The same integration lifecycle can run against a real OpenVSCode release with the `real_editor` marker. Set `VSC_GATEWAY_TEST_OPENVSCODE_ARCHIVE` to a local archive, or set both `VSC_GATEWAY_TEST_OPENVSCODE_URL` and `VSC_GATEWAY_TEST_OPENVSCODE_SHA256`. `VSC_GATEWAY_TEST_OPENVSCODE_VERSION` optionally controls the runtime version tag.
 

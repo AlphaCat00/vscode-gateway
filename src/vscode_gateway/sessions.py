@@ -363,13 +363,26 @@ class SessionService:
             await task
         tunnel.watcher_task = None
 
-    async def _close_listener(self, listener: asyncssh.SSHListener) -> str | None:
+    @staticmethod
+    def _stop_listener(listener: asyncssh.SSHListener) -> str | None:
         try:
             listener.close()
-            await asyncio.wait_for(listener.wait_closed(), timeout=_RESOURCE_CLOSE_TIMEOUT)
         except Exception as exc:
             return f"Forward listener close error: {exc}"
         return None
+
+    async def _wait_listener_closed(self, listener: asyncssh.SSHListener) -> str | None:
+        try:
+            await asyncio.wait_for(listener.wait_closed(), timeout=_RESOURCE_CLOSE_TIMEOUT)
+        except Exception as exc:
+            return f"Forward listener wait error: {exc}"
+        return None
+
+    async def _close_listener(self, listener: asyncssh.SSHListener) -> str | None:
+        error = self._stop_listener(listener)
+        if error is not None:
+            return error
+        return await self._wait_listener_closed(listener)
 
     async def _close_connection(self, conn: asyncssh.SSHClientConnection) -> str | None:
         try:
@@ -526,18 +539,19 @@ class SessionService:
         remote_absent = False
         connection_close_failed = False
         had_remote_identity = self._has_persisted_remote_identity(fresh)
+        listener: asyncssh.SSHListener | None = None
+        listener_stop_failed = False
 
         tunnel = self._tunnels.pop(session_id, None)
         ssh_conn: SshConnection | None = tunnel.ssh_conn if tunnel is not None else None
         if tunnel is not None:
             await self._cancel_forward_watcher(tunnel)
-            if tunnel.listener is not None:
-                listener_error = await self._close_listener(tunnel.listener)
+            listener = tunnel.listener
+            if listener is not None:
+                listener_error = self._stop_listener(listener)
                 if listener_error is not None:
                     errors.append(listener_error)
-                else:
-                    with suppress(Exception):
-                        await clear_tunnel_identity(self._db, str(session_id))
+                    listener_stop_failed = True
 
         try:
             if self._can_close_without_remote_inspection(fresh):
@@ -568,6 +582,14 @@ class SessionService:
                 if close_error is not None:
                     errors.append(close_error)
                     connection_close_failed = True
+
+        if listener is not None and not listener_stop_failed:
+            listener_error = await self._wait_listener_closed(listener)
+            if listener_error is not None:
+                errors.append(listener_error)
+            else:
+                with suppress(Exception):
+                    await clear_tunnel_identity(self._db, str(session_id))
 
         if connection_close_failed and ssh_conn is not None and not force:
             self._tunnels[session_id] = _SessionTunnel(

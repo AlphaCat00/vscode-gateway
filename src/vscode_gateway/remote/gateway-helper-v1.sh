@@ -120,7 +120,7 @@ cmd_session_start() {
     set -f
     [ -n "$openvscode_bin" ] || die "runtime_not_installed" "openvscode-server not found"
 
-    "$openvscode_bin" \
+    setsid "$openvscode_bin" \
         --host 127.0.0.1 \
         --port 0 \
         --server-base-path "/editor/$session_id" \
@@ -132,9 +132,11 @@ cmd_session_start() {
         > "$session_dir/server.log" 2>&1 &
 
     local pid=$!
+    local process_group_id=$(awk '{print $5}' /proc/$pid/stat 2>/dev/null || echo "0")
 
     sleep 1
-    if ! kill -0 "$pid" 2>/dev/null; then
+    if ! kill -0 "$pid" 2>/dev/null || [ "$process_group_id" != "$pid" ]; then
+        kill "$pid" 2>/dev/null || true
         die "start_failed" "openvscode-server exited immediately"
     fi
 
@@ -160,7 +162,7 @@ cmd_session_start() {
     done
 
     if [ -z "$port" ]; then
-        kill "$pid" 2>/dev/null || true
+        /bin/kill -TERM -- "-$process_group_id" 2>/dev/null || true
         die "port_discovery_failed" "Could not determine bound port"
     fi
 
@@ -173,6 +175,7 @@ cmd_session_start() {
     echo "$boot_id" > "$session_dir/boot_id"
     echo "$proc_start_id" > "$session_dir/proc_start_id"
     echo "$exe_path" > "$session_dir/executable"
+    echo "$process_group_id" > "$session_dir/process_group_id"
 
     printf '{"pid":%d,"port":%d,"boot_id":"%s","process_start_id":"%s","executable":"%s","session_dir":"%s"}\n' \
         "$pid" "$port" "$boot_id" "$proc_start_id" "$exe_path" "$session_dir"
@@ -199,11 +202,17 @@ cmd_session_inspect() {
     local boot_id=$(cat "$session_dir/boot_id" 2>/dev/null || echo "unknown")
     local proc_start_id=$(cat "$session_dir/proc_start_id" 2>/dev/null || echo "0")
     local exe_path=$(cat "$session_dir/executable" 2>/dev/null || echo "")
+    local process_group_id=$(cat "$session_dir/process_group_id" 2>/dev/null || awk '{print $5}' /proc/$pid/stat 2>/dev/null || echo "0")
     local current_boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo "unknown")
     local current_proc_start_id=$(awk '{print $22}' /proc/$pid/stat 2>/dev/null || echo "0")
+    local current_exe_path=$(readlink -f /proc/$pid/exe 2>/dev/null || echo "")
+    local current_process_group_id=$(awk '{print $5}' /proc/$pid/stat 2>/dev/null || echo "0")
 
     local identity_ok="true"
-    if [ "$boot_id" != "$current_boot_id" ] || [ "$proc_start_id" != "$current_proc_start_id" ]; then
+    if [ "$boot_id" != "$current_boot_id" ] || \
+       [ "$proc_start_id" != "$current_proc_start_id" ] || \
+       [ "$exe_path" != "$current_exe_path" ] || \
+       [ "$process_group_id" != "$current_process_group_id" ]; then
         identity_ok="false"
     fi
 
@@ -235,23 +244,34 @@ cmd_session_stop() {
 
     local boot_id=$(cat "$session_dir/boot_id" 2>/dev/null || echo "unknown")
     local proc_start_id=$(cat "$session_dir/proc_start_id" 2>/dev/null || echo "0")
+    local exe_path=$(cat "$session_dir/executable" 2>/dev/null || echo "")
+    local process_group_id=$(cat "$session_dir/process_group_id" 2>/dev/null || awk '{print $5}' /proc/$pid/stat 2>/dev/null || echo "0")
     local current_boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo "unknown")
     local current_proc_start_id=$(awk '{print $22}' /proc/$pid/stat 2>/dev/null || echo "0")
+    local current_exe_path=$(readlink -f /proc/$pid/exe 2>/dev/null || echo "")
+    local current_process_group_id=$(awk '{print $5}' /proc/$pid/stat 2>/dev/null || echo "0")
 
-    if [ "$boot_id" != "$current_boot_id" ] || [ "$proc_start_id" != "$current_proc_start_id" ]; then
+    if [ "$boot_id" != "$current_boot_id" ] || \
+       [ "$proc_start_id" != "$current_proc_start_id" ] || \
+       [ "$exe_path" != "$current_exe_path" ] || \
+       [ "$process_group_id" != "$current_process_group_id" ] || \
+       [ "$process_group_id" -le 1 ] 2>/dev/null; then
         die "identity_conflict" "Process identity mismatch; refusing to signal"
     fi
 
-    kill "$pid" 2>/dev/null || true
-    sleep 2
+    /bin/kill -TERM -- "-$process_group_id" 2>/dev/null || true
+    for i in $(seq 1 20); do
+        /bin/kill -0 -- "-$process_group_id" 2>/dev/null || break
+        sleep 0.1
+    done
 
-    if kill -0 "$pid" 2>/dev/null; then
-        kill -9 "$pid" 2>/dev/null || true
+    if /bin/kill -0 -- "-$process_group_id" 2>/dev/null; then
+        /bin/kill -KILL -- "-$process_group_id" 2>/dev/null || true
         sleep 1
     fi
 
-    if kill -0 "$pid" 2>/dev/null; then
-        die "stop_failed" "Process still running after SIGKILL"
+    if /bin/kill -0 -- "-$process_group_id" 2>/dev/null; then
+        die "stop_failed" "Process group still running after SIGKILL"
     fi
 
     printf '{"stopped":true,"pid":%s}\n' "$pid"
