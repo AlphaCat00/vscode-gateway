@@ -107,6 +107,8 @@ After trust is recorded, the client explicitly retries the session. A route may 
 
 The complete chain is owned by `SshConnection`; session cleanup and shutdown close the target and then the jumps in reverse order. Remote command arguments are converted with `shlex.join()` and passed as one command string; no local shell or system `ssh`, `scp`, or `ssh-keygen` process is used.
 
+If an active forwarding listener closes unexpectedly, the gateway removes the dead proxy target, closes the old connection chain, and opens fresh SSH chains with exponential backoff until `recovery_timeout` expires. Each attempt inspects the existing session UUID rather than starting another process. Reattachment requires the helper to validate the live process and requires every persisted PID, port, boot ID, process start ID, and executable value to match the inspection result. A replacement local forward is health-checked before one transaction refreshes the identities, clears prior errors, and restores `ready`. The remote process is not stopped merely because its network path failed. Exhausted attempts leave the row in `error` with `tunnel_lost` so manual retry or cleanup remains possible.
+
 ## Remote Runtime
 
 The gateway uploads `gateway-helper-v1.sh` to `/tmp/gateway-helper-v1.sh`. The helper manages state under `~/.vscode-gateway` and supports capability inspection, runtime inspection/installation, session start/status/stop, and cleanup.
@@ -144,7 +146,11 @@ Concurrency rules:
 - SQLite transactions are never held while waiting for SSH, network, or proxy work
 - owned connections, listeners, workers, watchers, and timers are closed or awaited during shutdown
 
-Startup recovery inspects durable sessions, reconnects to remote editors when identity remains valid, rebuilds local forwards, and restores disconnect timers. Sessions which cannot be recovered remain visible as errors until retry or successful cleanup.
+Startup recovery uses the same validated reattachment path for `starting` and `ready` rows and for errored rows which do not record an outstanding close request. It reconnects to remote editors when identity remains valid, rebuilds and verifies local forwards, refreshes remote identity missing from a crash window, and restores disconnect timers. Sessions which cannot be recovered remain visible as errors until retry or successful cleanup.
+
+Manual retry first attempts the same reattachment when the failed session may have reached the remote host. If the exact remote process remains alive, the existing row and session UUID return to `ready`; retry never calls the remote start operation in this case. An identity mismatch leaves the row and process untouched instead of falling through to destructive retry cleanup. Pre-remote host-key failures without resource identity retain the cleanup-and-open flow. A successful normal close confirms process absence, removes the remote session metadata, and deletes the durable row, so a later open always receives a new UUID rather than reusing a closed session.
+
+Forward watchers are bound to the exact `_SessionTunnel` they observe, so a stale watcher cannot tear down a replacement tunnel. Reconnect backoff does not hold the per-alias lock; each actual attempt does, allowing a close request to move the row to `stopping` between attempts and preventing recovery from overriding close intent.
 
 If normal cleanup cannot verify remote absence, an authenticated, CSRF-protected force close first attempts the same best-effort cleanup and then deletes the local row regardless of SSH or local resource-close errors. It also removes proxy and presence state and releases capacity. This can orphan a remote OpenVSCode process, never changes host trust, and logs the session ID plus whether persisted remote identity existed.
 
@@ -213,7 +219,7 @@ uv run pyright
 uv run pytest
 ```
 
-Unit tests use fake AsyncSSH connections and service doubles, including explicit jump-route expansion, per-hop policy and host-key challenges, route validation, and reverse-order cleanup. API integration tests launch ephemeral OpenSSH `sshd` instances on localhost and exercise authentication, CSRF, SSH config publication, key upload, host trust, retry, real SSH negotiation, SFTP runtime installation, forwarding, HTTP proxying, close, key deletion, and sequential jump/target trust. Their default runtime archive contains a small synthetic editor so the normal suite remains fast and offline. The real-editor case also verifies that API close leaves no process whose command references the closed session ID.
+Unit tests use fake AsyncSSH connections and service doubles, including explicit jump-route expansion, per-hop policy and host-key challenges, route validation, reverse-order cleanup, temporary reconnect failure, same-UUID process reattachment, identity mismatch rejection, and stale-watcher protection. API integration tests launch ephemeral OpenSSH `sshd` instances on localhost and exercise authentication, CSRF, SSH config publication, key upload, host trust, retry, real SSH negotiation, SFTP runtime installation, forwarding, HTTP proxying, close, key deletion, and sequential jump/target trust. Their default runtime archive contains a small synthetic editor so the normal suite remains fast and offline. The real-editor case also verifies that API close leaves no process whose command references the closed session ID.
 
 The same integration lifecycle can run against a real OpenVSCode release with the `real_editor` marker. Set `VSC_GATEWAY_TEST_OPENVSCODE_ARCHIVE` to a local archive, or set both `VSC_GATEWAY_TEST_OPENVSCODE_URL` and `VSC_GATEWAY_TEST_OPENVSCODE_SHA256`. `VSC_GATEWAY_TEST_OPENVSCODE_VERSION` optionally controls the runtime version tag.
 

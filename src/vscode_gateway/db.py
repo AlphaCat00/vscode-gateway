@@ -208,6 +208,58 @@ async def clear_tunnel_identity(db: aiosqlite.Connection, session_id: str) -> No
     await db.commit()
 
 
+async def begin_session_recovery(db: aiosqlite.Connection, session_id: str) -> bool:
+    """Mark an active session as recovering and forget its dead local forward."""
+    now = datetime.now(UTC).isoformat()
+    cursor = await db.execute(
+        """UPDATE sessions SET
+            stage = ?, local_port = NULL, tunnel_pid = NULL, updated_at = ?
+        WHERE id = ? AND state IN ('starting', 'ready', 'error')
+            AND close_reason IS NULL""",
+        (SessionStage.RECOVER.value, now, session_id),
+    )
+    await db.commit()
+    return cursor.rowcount == 1
+
+
+async def complete_session_recovery(
+    db: aiosqlite.Connection,
+    session_id: str,
+    *,
+    remote_pid: int,
+    remote_port: int,
+    remote_boot_id: str,
+    remote_process_start_id: str,
+    remote_executable: str,
+    local_port: int,
+) -> bool:
+    """Atomically publish verified remote identity and a replacement forward."""
+    now = datetime.now(UTC).isoformat()
+    cursor = await db.execute(
+        """UPDATE sessions SET
+            state = ?, stage = NULL,
+            remote_pid = ?, remote_port = ?, remote_boot_id = ?,
+            remote_process_start_id = ?, remote_executable = ?,
+            local_port = ?, tunnel_pid = 0,
+            error_code = NULL, error_message = NULL, updated_at = ?
+        WHERE id = ? AND state IN ('starting', 'ready', 'error')
+            AND close_reason IS NULL""",
+        (
+            SessionState.READY.value,
+            remote_pid,
+            remote_port,
+            remote_boot_id,
+            remote_process_start_id,
+            remote_executable,
+            local_port,
+            now,
+            session_id,
+        ),
+    )
+    await db.commit()
+    return cursor.rowcount == 1
+
+
 async def mark_ready(db: aiosqlite.Connection, session_id: str) -> None:
     now = datetime.now(UTC).isoformat()
     await db.execute(

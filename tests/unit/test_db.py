@@ -8,6 +8,8 @@ import aiosqlite
 import pytest
 
 from vscode_gateway.db import (
+    begin_session_recovery,
+    complete_session_recovery,
     delete_session,
     get_session,
     get_session_by_alias,
@@ -90,6 +92,89 @@ async def test_mark_ready(db: aiosqlite.Connection) -> None:
     assert fetched is not None
     assert fetched.state == SessionState.READY
     assert fetched.stage is None
+
+
+async def test_session_recovery_transitions_existing_row_to_ready(
+    db: aiosqlite.Connection,
+) -> None:
+    import uuid
+
+    sid = uuid.uuid4()
+    record = SessionRecord(
+        id=sid,
+        alias="recover-host",
+        state=SessionState.ERROR,
+        error_code="tunnel_lost",
+        error_message="network failed",
+        local_port=12345,
+        tunnel_pid=0,
+    )
+    await insert_session(db, record)
+
+    assert await begin_session_recovery(db, str(sid)) is True
+    recovering = await get_session(db, str(sid))
+    assert recovering is not None
+    assert recovering.stage == SessionStage.RECOVER
+    assert recovering.local_port is None
+    assert recovering.tunnel_pid is None
+
+    assert (
+        await complete_session_recovery(
+            db,
+            str(sid),
+            remote_pid=4242,
+            remote_port=9876,
+            remote_boot_id="boot-abc",
+            remote_process_start_id="start-xyz",
+            remote_executable="/opt/openvscode/node",
+            local_port=54321,
+        )
+        is True
+    )
+    ready = await get_session(db, str(sid))
+    assert ready is not None
+    assert ready.id == sid
+    assert ready.state == SessionState.READY
+    assert ready.stage is None
+    assert ready.remote_pid == 4242
+    assert ready.local_port == 54321
+    assert ready.error_code is None
+    assert ready.error_message is None
+
+
+async def test_session_recovery_does_not_override_close_intent(
+    db: aiosqlite.Connection,
+) -> None:
+    import uuid
+
+    sid = uuid.uuid4()
+    await insert_session(
+        db,
+        SessionRecord(
+            id=sid,
+            alias="closing-host",
+            state=SessionState.ERROR,
+            close_reason="user_requested",
+        ),
+    )
+
+    assert await begin_session_recovery(db, str(sid)) is False
+    assert (
+        await complete_session_recovery(
+            db,
+            str(sid),
+            remote_pid=4242,
+            remote_port=9876,
+            remote_boot_id="boot-abc",
+            remote_process_start_id="start-xyz",
+            remote_executable="/opt/openvscode/node",
+            local_port=54321,
+        )
+        is False
+    )
+    unchanged = await get_session(db, str(sid))
+    assert unchanged is not None
+    assert unchanged.state == SessionState.ERROR
 
 
 async def test_mark_error(db: aiosqlite.Connection) -> None:

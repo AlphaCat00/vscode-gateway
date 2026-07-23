@@ -15,6 +15,7 @@ import aiosqlite
 import asyncssh
 import pytest
 
+from vscode_gateway import sessions as sessions_mod
 from vscode_gateway.db import (
     get_session,
     insert_session,
@@ -194,6 +195,50 @@ def _make_record(
         state=state,
         stage=stage,
     )
+
+
+def _running_inspection(*, pid: int = 4242) -> dict[str, Any]:
+    return {
+        "running": True,
+        "identity_ok": True,
+        "pid": pid,
+        "port": 9876,
+        "boot_id": "boot-abc",
+        "process_start_id": "start-xyz",
+        "executable": "/opt/openvscode/node",
+        "session_dir": "/home/test/.vscode-gateway/sessions/test",
+    }
+
+
+def _ready_record(alias: str, sid: SessionId) -> SessionRecord:
+    return SessionRecord(
+        id=sid,
+        alias=alias,
+        state=SessionState.READY,
+        remote_pid=4242,
+        remote_port=9876,
+        remote_boot_id="boot-abc",
+        remote_process_start_id="start-xyz",
+        remote_executable="/opt/openvscode/node",
+        local_port=12345,
+        tunnel_pid=0,
+    )
+
+
+def _install_reattach_stubs(monkeypatch: pytest.MonkeyPatch, *, pid: int = 4242) -> None:
+    async def _inspect(
+        self: RuntimeService,
+        connection: asyncssh.SSHClientConnection,
+        session_id: SessionId,
+    ) -> dict[str, Any]:
+        del self, connection, session_id
+        return _running_inspection(pid=pid)
+
+    async def _verify(self: SessionService, session_id: SessionId, local_port: int) -> None:
+        del self, session_id, local_port
+
+    monkeypatch.setattr(RuntimeService, "inspect_session", _inspect)
+    monkeypatch.setattr(SessionService, "_verify_editor_health", _verify)
 
 
 # ---------------------------------------------------------------------------
@@ -518,6 +563,240 @@ async def test_recovery_inspection_failure_retains_error_row_and_capacity(
     assert remaining is not None
     assert remaining.error_code == ErrorCode.SSH_HOST_UNKNOWN.value
     assert remaining.remote_pid == 1234
+
+
+async def test_recover_all_reattaches_same_session_and_process(
+    service: SessionService,
+    db: aiosqlite.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_reattach_stubs(monkeypatch)
+    sid = uuid.uuid4()
+    await insert_session(db, _ready_record("host-a", sid))
+
+    report = await service.recover_all()
+
+    assert report.recovered == 1
+    assert report.failed == 0
+    recovered = await get_session(db, str(sid))
+    assert recovered is not None
+    assert recovered.id == sid
+    assert recovered.remote_pid == 4242
+    assert recovered.state == SessionState.READY
+    assert service._registry.lookup(sid) == 54321
+    assert sid in service._tunnels
+    await service.shutdown()
+
+
+async def test_tunnel_exit_reconnects_with_same_session_id(
+    service: SessionService,
+    db: aiosqlite.Connection,
+    connection_service: _FakeConnectionService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_reattach_stubs(monkeypatch)
+    sid = uuid.uuid4()
+    await insert_session(db, _ready_record("host-a", sid))
+    service._capacity_acquire(sid)
+
+    old_connection = await connection_service.connect_for_session(session_id=sid, alias="host-a")
+    old_listener = _FakeListener()
+    old_tunnel = sessions_mod._SessionTunnel(
+        ssh_conn=old_connection,
+        listener=cast(asyncssh.SSHListener, old_listener),
+    )
+    service._tunnels[sid] = old_tunnel
+    service._registry.add(sid, 12345)
+
+    await service.on_tunnel_exit(sid, 0, expected_tunnel=old_tunnel)
+
+    recovered = await get_session(db, str(sid))
+    assert recovered is not None
+    assert recovered.id == sid
+    assert recovered.state == SessionState.READY
+    assert recovered.remote_pid == 4242
+    assert recovered.local_port == 54321
+    assert recovered.error_code is None
+    assert service._registry.lookup(sid) == 54321
+    assert service._tunnels[sid] is not old_tunnel
+    old_handle = cast(_FakeConnectionHandle, old_connection.conn)
+    assert old_listener.closed is True
+    assert old_handle.closed is True
+    assert len(connection_service.connections) == 2
+    await service.shutdown()
+
+
+async def test_tunnel_exit_retries_after_temporary_connect_failure(
+    service: SessionService,
+    db: aiosqlite.Connection,
+    connection_service: _FakeConnectionService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_reattach_stubs(monkeypatch)
+    monkeypatch.setattr(sessions_mod, "_RECOVERY_RETRY_INITIAL_DELAY", 0.0)
+    sid = uuid.uuid4()
+    await insert_session(db, _ready_record("host-a", sid))
+    service._capacity_acquire(sid)
+
+    old_connection = await connection_service.connect_for_session(session_id=sid, alias="host-a")
+    old_tunnel = sessions_mod._SessionTunnel(
+        ssh_conn=old_connection,
+        listener=cast(asyncssh.SSHListener, _FakeListener()),
+    )
+    service._tunnels[sid] = old_tunnel
+
+    original_connect = connection_service.connect_for_session
+    attempts = 0
+
+    async def _flaky_connect(
+        *,
+        session_id: SessionId,
+        alias: str,
+        role: HostKeyRole = "target",
+    ) -> SshConnection:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise GatewayError(ErrorCode.SSH_UNREACHABLE, "temporary outage", status_code=502)
+        return await original_connect(session_id=session_id, alias=alias, role=role)
+
+    monkeypatch.setattr(connection_service, "connect_for_session", _flaky_connect)
+
+    await service.on_tunnel_exit(sid, 0, expected_tunnel=old_tunnel)
+
+    recovered = await get_session(db, str(sid))
+    assert attempts == 2
+    assert recovered is not None
+    assert recovered.id == sid
+    assert recovered.state == SessionState.READY
+    assert service._registry.lookup(sid) == 54321
+    await service.shutdown()
+
+
+async def test_stale_tunnel_watcher_cannot_replace_current_tunnel(
+    service: SessionService,
+    db: aiosqlite.Connection,
+    connection_service: _FakeConnectionService,
+) -> None:
+    sid = uuid.uuid4()
+    await insert_session(db, _ready_record("host-a", sid))
+    old_connection = await connection_service.connect_for_session(session_id=sid, alias="host-a")
+    replacement_connection = await connection_service.connect_for_session(
+        session_id=sid, alias="host-a"
+    )
+    old_tunnel = sessions_mod._SessionTunnel(ssh_conn=old_connection)
+    replacement = sessions_mod._SessionTunnel(ssh_conn=replacement_connection)
+    service._tunnels[sid] = replacement
+    service._registry.add(sid, 54321)
+
+    await service.on_tunnel_exit(sid, 0, expected_tunnel=old_tunnel)
+
+    assert service._tunnels[sid] is replacement
+    assert service._registry.lookup(sid) == 54321
+    assert cast(_FakeConnectionHandle, replacement_connection.conn).closed is False
+    await service._close_ssh_connection(old_connection)
+    await service.shutdown()
+
+
+async def test_tunnel_exit_rejects_changed_remote_process_identity(
+    service: SessionService,
+    db: aiosqlite.Connection,
+    connection_service: _FakeConnectionService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_reattach_stubs(monkeypatch, pid=9999)
+    sid = uuid.uuid4()
+    await insert_session(db, _ready_record("host-a", sid))
+    service._capacity_acquire(sid)
+    old_connection = await connection_service.connect_for_session(session_id=sid, alias="host-a")
+    old_tunnel = sessions_mod._SessionTunnel(
+        ssh_conn=old_connection,
+        listener=cast(asyncssh.SSHListener, _FakeListener()),
+    )
+    service._tunnels[sid] = old_tunnel
+
+    await service.on_tunnel_exit(sid, 0, expected_tunnel=old_tunnel)
+
+    failed = await get_session(db, str(sid))
+    assert failed is not None
+    assert failed.state == SessionState.ERROR
+    assert failed.error_code == ErrorCode.TUNNEL_LOST.value
+    assert failed.remote_pid == 4242
+    assert service._registry.lookup(sid) is None
+    assert service._tunnels.get(sid) is None
+
+
+async def test_retry_reattaches_alive_process_without_changing_session_id(
+    service: SessionService,
+    db: aiosqlite.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_reattach_stubs(monkeypatch)
+    sid = uuid.uuid4()
+    record = _ready_record("host-a", sid)
+    record.state = SessionState.ERROR
+    record.stage = SessionStage.RECOVER
+    record.error_code = ErrorCode.TUNNEL_LOST.value
+    record.error_message = "network failed"
+    await insert_session(db, record)
+    service._capacity_acquire(sid)
+
+    async def _unexpected_start(
+        self: RuntimeService,
+        connection: asyncssh.SSHClientConnection,
+        session_id: SessionId,
+    ) -> Any:
+        del self, connection, session_id
+        raise AssertionError("retry must not start a second remote process")
+
+    monkeypatch.setattr(RuntimeService, "start_session", _unexpected_start)
+
+    retried = await service.retry("host-a")
+
+    assert retried.id == sid
+    assert retried.state == SessionState.READY
+    recovered = await get_session(db, str(sid))
+    assert recovered is not None
+    assert recovered.id == sid
+    assert recovered.remote_pid == 4242
+    await service.shutdown()
+
+
+async def test_retry_does_not_stop_a_changed_remote_process(
+    service: SessionService,
+    db: aiosqlite.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_reattach_stubs(monkeypatch, pid=9999)
+    sid = uuid.uuid4()
+    record = _ready_record("host-a", sid)
+    record.state = SessionState.ERROR
+    record.error_code = ErrorCode.TUNNEL_LOST.value
+    await insert_session(db, record)
+    service._capacity_acquire(sid)
+    stop_calls: list[SessionId] = []
+
+    async def _stop(
+        self: RuntimeService,
+        connection: asyncssh.SSHClientConnection,
+        session_id: SessionId,
+    ) -> bool:
+        del self, connection
+        stop_calls.append(session_id)
+        return True
+
+    monkeypatch.setattr(RuntimeService, "stop_session", _stop)
+
+    with pytest.raises(GatewayError) as exc_info:
+        await service.retry("host-a")
+
+    assert exc_info.value.code == ErrorCode.RECOVERY_FAILED
+    assert stop_calls == []
+    retained = await get_session(db, str(sid))
+    assert retained is not None
+    assert retained.id == sid
+    assert retained.remote_pid == 4242
+    assert retained.state == SessionState.ERROR
 
 
 async def test_do_close_retains_capacity_on_cleanup_failure(

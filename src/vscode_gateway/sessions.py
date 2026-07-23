@@ -16,8 +16,10 @@ import asyncssh
 import structlog
 
 from vscode_gateway.db import (
+    begin_session_recovery,
     clear_remote_identity,
     clear_tunnel_identity,
+    complete_session_recovery,
     delete_session,
     get_session,
     get_session_by_alias,
@@ -38,6 +40,7 @@ from vscode_gateway.host_trust import HostTrustService
 from vscode_gateway.models import (
     CloseReason,
     RecoveryReport,
+    RuntimeIdentity,
     SessionId,
     SessionRecord,
     SessionStage,
@@ -53,6 +56,8 @@ from vscode_gateway.ssh_connection import SshConnection, SshConnectionService
 
 logger = structlog.get_logger()
 _RESOURCE_CLOSE_TIMEOUT = 5.0
+_RECOVERY_RETRY_INITIAL_DELAY = 1.0
+_RECOVERY_RETRY_MAX_DELAY = 5.0
 _PRE_REMOTE_FAILURE_CODES = frozenset(
     {
         ErrorCode.SSH_NO_UPLOADED_KEYS.value,
@@ -83,6 +88,12 @@ class _SessionTunnel:
     ssh_conn: SshConnection
     listener: asyncssh.SSHListener | None = None
     watcher_task: asyncio.Task[None] | None = None
+
+
+class _RemoteSessionUnavailableError(Exception):
+    def __init__(self, message: str, *, absent: bool = False) -> None:
+        super().__init__(message)
+        self.absent = absent
 
 
 class SessionService:
@@ -348,7 +359,7 @@ class SessionService:
                 await tunnel.listener.wait_closed()  # type: ignore[union-attr]
             except asyncio.CancelledError:
                 return
-            await self.on_tunnel_exit(session_id, 0)
+            await self.on_tunnel_exit(session_id, 0, expected_tunnel=tunnel)
 
         task = self._spawn(_watch())
         if task is not None:
@@ -400,6 +411,209 @@ class SessionService:
             if error is not None:
                 errors.append(error)
         return "; ".join(errors) if errors else None
+
+    async def _close_tunnel_resources(self, tunnel: _SessionTunnel) -> str | None:
+        """Stop new forwards, close SSH, then wait for forwarded channels."""
+        await self._cancel_forward_watcher(tunnel)
+        errors: list[str] = []
+        listener_stop_failed = False
+        if tunnel.listener is not None:
+            error = self._stop_listener(tunnel.listener)
+            if error is not None:
+                errors.append(error)
+                listener_stop_failed = True
+
+        error = await self._close_ssh_connection(tunnel.ssh_conn)
+        if error is not None:
+            errors.append(error)
+
+        if tunnel.listener is not None and not listener_stop_failed:
+            error = await self._wait_listener_closed(tunnel.listener)
+            if error is not None:
+                errors.append(error)
+        return "; ".join(errors) if errors else None
+
+    @staticmethod
+    def _identity_from_inspection(
+        record: SessionRecord,
+        inspection: dict[str, Any],
+    ) -> RuntimeIdentity:
+        if inspection.get("running") is not True:
+            raise _RemoteSessionUnavailableError("Remote process is absent", absent=True)
+        if inspection.get("identity_ok") is not True:
+            raise _RemoteSessionUnavailableError(
+                "Remote process identity does not match helper state"
+            )
+
+        pid = inspection.get("pid")
+        port = inspection.get("port")
+        boot_id = inspection.get("boot_id")
+        process_start_id = inspection.get("process_start_id")
+        executable = inspection.get("executable")
+        if (
+            type(pid) is not int
+            or pid <= 0
+            or type(port) is not int
+            or port <= 0
+            or not isinstance(boot_id, str)
+            or not boot_id
+            or not isinstance(process_start_id, str)
+            or not process_start_id
+            or not isinstance(executable, str)
+            or not executable
+        ):
+            raise _RemoteSessionUnavailableError("Remote process identity is incomplete")
+
+        persisted_and_inspected = (
+            (record.remote_pid, pid),
+            (record.remote_port, port),
+            (record.remote_boot_id, boot_id),
+            (record.remote_process_start_id, process_start_id),
+            (record.remote_executable, executable),
+        )
+        if any(
+            persisted is not None and persisted != inspected
+            for persisted, inspected in persisted_and_inspected
+        ):
+            raise _RemoteSessionUnavailableError(
+                "Remote process identity changed while disconnected"
+            )
+
+        return RuntimeIdentity(
+            pid=pid,
+            port=port,
+            boot_id=boot_id,
+            process_start_id=process_start_id,
+            executable=executable,
+            session_dir=(
+                inspection.get("session_dir")
+                if isinstance(inspection.get("session_dir"), str)
+                else None
+            ),
+        )
+
+    async def _reattach_existing_session(self, record: SessionRecord) -> SessionView:
+        """Verify an existing remote process and publish a replacement forward."""
+        if self._tunnels.get(record.id) is not None:
+            raise RuntimeError("Cannot reattach while local tunnel resources are still owned")
+        if not await begin_session_recovery(self._db, str(record.id)):
+            raise _RemoteSessionUnavailableError("Session is no longer eligible for recovery")
+
+        ssh_conn: SshConnection | None = None
+        listener: asyncssh.SSHListener | None = None
+        resources_installed = False
+        try:
+            ssh_conn = await self._connection_service.connect_for_session(
+                session_id=record.id,
+                alias=record.alias,
+            )
+            inspection = await self._runtime.inspect_session(ssh_conn.conn, record.id)
+            try:
+                remote = self._identity_from_inspection(record, inspection)
+            except _RemoteSessionUnavailableError as exc:
+                if exc.absent:
+                    await self._runtime.remove_session(ssh_conn.conn, record.id)
+                raise
+
+            listener, local_port = await self._connection_service.forward_local_port(
+                ssh_conn, remote.port
+            )
+            await self._verify_editor_health(record.id, local_port)
+
+            completion_task = asyncio.ensure_future(
+                complete_session_recovery(
+                    self._db,
+                    str(record.id),
+                    remote_pid=remote.pid,
+                    remote_port=remote.port,
+                    remote_boot_id=remote.boot_id,
+                    remote_process_start_id=remote.process_start_id,
+                    remote_executable=remote.executable,
+                    local_port=local_port,
+                )
+            )
+            try:
+                completed = await asyncio.shield(completion_task)
+            except asyncio.CancelledError:
+                with suppress(Exception):
+                    await completion_task
+                raise
+            if not completed:
+                raise _RemoteSessionUnavailableError("Session changed state during recovery")
+
+            tunnel = _SessionTunnel(ssh_conn=ssh_conn, listener=listener)
+            self._tunnels[record.id] = tunnel
+            resources_installed = True
+            self._registry.add(record.id, local_port)
+            self._spawn_forward_watcher(record.id)
+
+            recovered = await get_session(self._db, str(record.id))
+            if recovered is None:
+                raise RuntimeError("Session disappeared after recovery")
+            return self._to_view(recovered)
+        except BaseException as exc:
+            if not resources_installed and ssh_conn is not None:
+                tunnel = _SessionTunnel(ssh_conn=ssh_conn, listener=listener)
+                close_error = await self._close_tunnel_resources(tunnel)
+                if close_error is not None:
+                    logger.warning(
+                        "session_reattach_cleanup_failed",
+                        session_id=str(record.id),
+                        error=close_error,
+                    )
+                    self._tunnels[record.id] = tunnel
+                    if isinstance(exc, Exception):
+                        raise GatewayError(
+                            ErrorCode.RECOVERY_FAILED,
+                            close_error,
+                            status_code=500,
+                        ) from exc
+            raise
+
+    async def _reattach_with_retry(
+        self,
+        record: SessionRecord,
+        *,
+        lock_each_attempt: bool = False,
+    ) -> SessionView:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._settings.recovery_timeout
+        delay = _RECOVERY_RETRY_INITIAL_DELAY
+        attempt = 0
+
+        async def _attempt() -> SessionView:
+            if not lock_each_attempt:
+                return await self._reattach_existing_session(record)
+            async with self._get_lock(record.alias):
+                fresh = await get_session(self._db, str(record.id))
+                if fresh is None or fresh.state == SessionState.STOPPING:
+                    raise _RemoteSessionUnavailableError(
+                        "Session closed while reconnection was pending"
+                    )
+                return await self._reattach_existing_session(fresh)
+
+        while True:
+            attempt += 1
+            try:
+                async with asyncio.timeout_at(deadline):
+                    return await _attempt()
+            except asyncio.CancelledError:
+                raise
+            except _RemoteSessionUnavailableError:
+                raise
+            except Exception as exc:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise
+                logger.warning(
+                    "session_reconnect_attempt_failed",
+                    session_id=str(record.id),
+                    alias=record.alias,
+                    attempt=attempt,
+                    error=str(exc),
+                )
+                await asyncio.sleep(min(delay, remaining))
+                delay = min(delay * 2, _RECOVERY_RETRY_MAX_DELAY)
 
     async def _finalize_open_read(
         self,
@@ -688,6 +902,33 @@ class SessionService:
             self._cancel_grace(session.id)
             self._registry.remove(session.id)
 
+            if session.close_reason is None and not self._can_close_without_remote_inspection(
+                session
+            ):
+                try:
+                    return await self._reattach_with_retry(session)
+                except asyncio.CancelledError:
+                    raise
+                except _RemoteSessionUnavailableError as exc:
+                    if not exc.absent:
+                        raise GatewayError(
+                            ErrorCode.RECOVERY_FAILED,
+                            str(exc),
+                            status_code=409,
+                        ) from exc
+                    logger.info(
+                        "session_retry_remote_absent",
+                        session_id=str(session.id),
+                        alias=alias,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "session_retry_reattach_failed",
+                        session_id=str(session.id),
+                        alias=alias,
+                        error=str(exc),
+                    )
+
             try:
                 await self._do_close(session)
             except Exception as exc:
@@ -716,88 +957,40 @@ class SessionService:
 
         for record in sessions:
             async with self._get_lock(record.alias):
-                ssh_conn: SshConnection | None = None
-                listener: asyncssh.SSHListener | None = None
-                keep_resources = False
                 try:
-                    if record.state in (SessionState.STARTING, SessionState.READY):
-                        ssh_conn = await self._connection_service.connect_for_session(
-                            session_id=record.id, alias=record.alias
-                        )
-                        insp = await self._runtime.inspect_session(ssh_conn.conn, record.id)
-                        if insp["running"] is False:
-                            if record.state == SessionState.STARTING:
-                                await self._runtime.remove_session(ssh_conn.conn, record.id)
-                                close_error = await self._close_ssh_connection(ssh_conn)
-                                if close_error is not None:
-                                    raise GatewayError(
-                                        ErrorCode.RECOVERY_FAILED,
-                                        close_error,
-                                        status_code=500,
-                                    )
-                                ssh_conn = None
+                    can_reattach = record.state in (
+                        SessionState.STARTING,
+                        SessionState.READY,
+                    ) or (record.state == SessionState.ERROR and record.close_reason is None)
+                    if can_reattach:
+                        try:
+                            await self._reattach_existing_session(record)
+                        except _RemoteSessionUnavailableError as exc:
+                            if exc.absent and record.state in (
+                                SessionState.STARTING,
+                                SessionState.ERROR,
+                            ):
                                 await delete_session(self._db, str(record.id))
                                 cleaned += 1
                                 self._capacity_release(record.id)
                             else:
-                                await clear_remote_identity(self._db, str(record.id))
+                                if exc.absent:
+                                    await clear_remote_identity(self._db, str(record.id))
+                                    message = "Remote process absent after restart"
+                                else:
+                                    message = str(exc)
                                 await mark_error(
                                     self._db,
                                     str(record.id),
                                     ErrorCode.RECOVERY_FAILED.value,
-                                    "Remote process absent after restart",
+                                    message,
+                                    stage=SessionStage.RECOVER,
                                 )
                                 failed += 1
                             continue
 
-                        port = insp.get("port")
-                        invalid_identity = not insp.get("identity_ok", False)
-                        invalid_port = not isinstance(port, int) or port <= 0
-                        if invalid_identity or invalid_port:
-                            await mark_error(
-                                self._db,
-                                str(record.id),
-                                ErrorCode.RECOVERY_FAILED.value,
-                                "Remote process identity mismatch or invalid port",
-                            )
-                            failed += 1
-                            continue
-
-                        remote_port = cast(int, port)
-                        listener, local_port = await self._connection_service.forward_local_port(
-                            ssh_conn, remote_port
-                        )
-                        await set_tunnel_identity(
-                            self._db,
-                            str(record.id),
-                            local_port,
-                            0,
-                        )
-                        if record.state == SessionState.STARTING:
-                            await mark_ready(self._db, str(record.id))
-
-                        self._tunnels[record.id] = _SessionTunnel(
-                            ssh_conn=ssh_conn,
-                            listener=listener,
-                        )
-                        self._registry.add(record.id, local_port)
-                        self._spawn_forward_watcher(record.id)
-                        keep_resources = True
                         recovered += 1
-
-                        if record.disconnect_deadline_at:
-                            deadline = record.disconnect_deadline_at
-                            if deadline > datetime.now(UTC):
-                                task = self._spawn(self._grace_watcher(record.id, deadline))
-                                if task is not None:
-                                    self._grace_timers[record.id] = cast(asyncio.Task[None], task)
-                            else:
-                                self._spawn(
-                                    self.close(
-                                        record.alias,
-                                        CloseReason.DISCONNECT_GRACE_EXPIRED,
-                                    )
-                                )
+                        self._restore_disconnect_timer(record)
 
                     elif record.state == SessionState.STOPPING:
                         await self._do_close(record)
@@ -810,22 +1003,32 @@ class SessionService:
                         ssh_conn = await self._connection_service.connect_for_session(
                             session_id=record.id, alias=record.alias
                         )
-                        insp = await self._runtime.inspect_session(ssh_conn.conn, record.id)
-                        if insp["running"] is False:
-                            await self._runtime.remove_session(ssh_conn.conn, record.id)
+                        remote_absent = False
+                        try:
+                            inspection = await self._runtime.inspect_session(
+                                ssh_conn.conn, record.id
+                            )
+                            if inspection["running"] is False:
+                                await self._runtime.remove_session(ssh_conn.conn, record.id)
+                                remote_absent = True
+                            else:
+                                failed += 1
+                        finally:
                             close_error = await self._close_ssh_connection(ssh_conn)
                             if close_error is not None:
+                                self._tunnels[record.id] = _SessionTunnel(
+                                    ssh_conn=ssh_conn,
+                                    listener=None,
+                                )
                                 raise GatewayError(
                                     ErrorCode.RECOVERY_FAILED,
                                     close_error,
                                     status_code=500,
                                 )
-                            ssh_conn = None
+                        if remote_absent:
                             await delete_session(self._db, str(record.id))
                             cleaned += 1
                             self._capacity_release(record.id)
-                        else:
-                            failed += 1
 
                 except Exception as exc:
                     if record.state != SessionState.ERROR:
@@ -834,6 +1037,7 @@ class SessionService:
                             str(record.id),
                             ErrorCode.RECOVERY_FAILED.value,
                             "Recovery attempt failed",
+                            stage=SessionStage.RECOVER,
                         )
                     logger.warning(
                         "session_recovery_failed",
@@ -842,19 +1046,6 @@ class SessionService:
                         error=str(exc),
                     )
                     failed += 1
-                finally:
-                    if not keep_resources:
-                        if listener is not None:
-                            await self._close_listener(listener)
-                            with suppress(Exception):
-                                await clear_tunnel_identity(self._db, str(record.id))
-                        if ssh_conn is not None:
-                            close_error = await self._close_ssh_connection(ssh_conn)
-                            if close_error is not None:
-                                self._tunnels[record.id] = _SessionTunnel(
-                                    ssh_conn=ssh_conn,
-                                    listener=None,
-                                )
 
         remaining_after = await list_sessions(self._db)
         error_sessions_remaining = sum(1 for r in remaining_after if r.state == SessionState.ERROR)
@@ -870,6 +1061,17 @@ class SessionService:
             error_sessions_remaining=error_sessions_remaining,
             orphaned_resources_remaining=orphaned_resources_remaining,
         )
+
+    def _restore_disconnect_timer(self, record: SessionRecord) -> None:
+        deadline = record.disconnect_deadline_at
+        if deadline is None:
+            return
+        if deadline > datetime.now(UTC):
+            task = self._spawn(self._grace_watcher(record.id, deadline))
+            if task is not None:
+                self._grace_timers[record.id] = cast(asyncio.Task[None], task)
+            return
+        self._spawn(self.close(record.alias, CloseReason.DISCONNECT_GRACE_EXPIRED))
 
     async def reconcile_catalog(self, task_group: asyncio.TaskGroup) -> None:
         catalog = self._catalog.snapshot
@@ -1058,29 +1260,64 @@ class SessionService:
             self._spawn(set_disconnect_deadline(self._db, str(session_id), now, deadline))
             self._spawn(update_connected_clients(self._db, str(session_id), count))
 
-    async def on_tunnel_exit(self, session_id: SessionId, return_code: int) -> None:
-        record = await get_session(self._db, str(session_id))
-        if record is None:
+    async def on_tunnel_exit(
+        self,
+        session_id: SessionId,
+        return_code: int,
+        *,
+        expected_tunnel: _SessionTunnel | None = None,
+    ) -> None:
+        initial = await get_session(self._db, str(session_id))
+        if initial is None:
             return
-        if record.state == SessionState.STOPPING:
-            return
+        async with self._get_lock(initial.alias):
+            record = await get_session(self._db, str(session_id))
+            if record is None or record.state == SessionState.STOPPING:
+                return
 
-        self._registry.remove(session_id)
-        await mark_error(
-            self._db,
-            str(session_id),
-            ErrorCode.TUNNEL_LOST.value,
-            f"SSH tunnel exited with code {return_code}",
-        )
-        tunnel = self._tunnels.pop(session_id, None)
-        ssh_conn = tunnel.ssh_conn if tunnel is not None else None
-        if ssh_conn is not None:
-            with suppress(Exception):
-                await self._runtime.stop_session(ssh_conn.conn, session_id)
-            close_error = await self._close_ssh_connection(ssh_conn)
-            if close_error is not None:
-                logger.warning(
-                    "tunnel_exit_connection_close_failed",
-                    session_id=str(session_id),
-                    error=close_error,
-                )
+            tunnel = self._tunnels.get(session_id)
+            if expected_tunnel is not None and tunnel is not expected_tunnel:
+                return
+
+            self._registry.remove(session_id)
+            if tunnel is not None:
+                self._tunnels.pop(session_id, None)
+                close_error = await self._close_tunnel_resources(tunnel)
+                if close_error is not None:
+                    logger.warning(
+                        "tunnel_exit_connection_close_failed",
+                        session_id=str(session_id),
+                        error=close_error,
+                    )
+                    self._tunnels[session_id] = tunnel
+
+        try:
+            await self._reattach_with_retry(record, lock_each_attempt=True)
+            logger.info(
+                "session_reconnected",
+                session_id=str(session_id),
+                alias=record.alias,
+            )
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "session_reconnect_failed",
+                session_id=str(session_id),
+                alias=record.alias,
+                return_code=return_code,
+                error=str(exc),
+            )
+
+        async with self._get_lock(record.alias):
+            fresh = await get_session(self._db, str(session_id))
+            if fresh is None or fresh.state == SessionState.STOPPING:
+                return
+            await mark_error(
+                self._db,
+                str(session_id),
+                ErrorCode.TUNNEL_LOST.value,
+                "SSH tunnel closed and reconnection failed",
+                stage=SessionStage.RECOVER,
+            )
