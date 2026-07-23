@@ -111,10 +111,12 @@ If an active forwarding listener closes unexpectedly, the gateway removes the de
 
 ## Remote Runtime
 
-The gateway uploads `gateway-helper-v1.sh` to `/tmp/gateway-helper-v1.sh`. The helper manages state under `~/.vscode-gateway` and supports capability inspection, runtime inspection/installation, session start/status/stop, and cleanup. Remote state is separated into persistent alias profiles and ephemeral process sessions:
+The gateway uploads `gateway-helper-v1.sh` to `~/.vscode-gateway/gateway-helper-v1.sh`, with both the directory and script restricted to mode `0700`. The helper manages state under `~/.vscode-gateway` and supports capability inspection, runtime inspection/installation, session start/status/stop, and cleanup. Remote state is separated into persistent alias profiles and ephemeral process sessions:
 
 ```text
 ~/.vscode-gateway/
+  gateway-helper-v1.sh
+  openvscode-server-v<version>-linux-<arch>.tar.gz  # present only while staging
   profiles/<sha256-of-literal-alias>/
     user-data/
     server-data/
@@ -129,7 +131,7 @@ The gateway uploads `gateway-helper-v1.sh` to `/tmp/gateway-helper-v1.sh`. The h
     process_group_id
 ```
 
-Python computes the lowercase SHA-256 digest from the UTF-8 literal alias and the helper accepts only a 64-character lowercase hexadecimal profile ID. OpenVSCode receives the profile's `user-data` and `server-data` paths, while logs and process identity remain UUID-scoped. The one-active-session-per-alias rule prevents two gateway-owned processes from concurrently using one profile.
+Python computes the lowercase SHA-256 digest from the UTF-8 literal alias and the helper accepts only a 64-character lowercase hexadecimal profile ID. OpenVSCode receives the profile's `user-data` and `server-data` paths, while logs and process identity remain UUID-scoped. The one-active-session-per-alias rule prevents two gateway-owned processes from concurrently using one profile. Runtime archives are uploaded under their configured release URL basename, preserving the GitHub filename, and removed after successful installation.
 
 For a new session the gateway:
 
@@ -137,7 +139,7 @@ For a new session the gateway:
 2. Creates a durable `starting` row.
 3. Opens and verifies an AsyncSSH connection.
 4. Uploads and probes the helper.
-5. Downloads a pinned OpenVSCode archive locally if absent, verifies its SHA-256 hash, and uploads it with SFTP when the remote runtime is absent.
+5. Downloads a pinned OpenVSCode archive locally if absent, verifies its SHA-256 hash, and uploads it with its GitHub filename below `~/.vscode-gateway/` when the remote runtime is absent.
 6. Starts OpenVSCode folderless on remote loopback with `--without-connection-token`.
 7. Stores the remote PID, port, boot ID, process start ID, executable, and session directory.
 8. Creates an AsyncSSH local forward on gateway loopback.
@@ -245,7 +247,6 @@ The same integration lifecycle can run against a real OpenVSCode release with th
 
 - SSH config validation is a defensive directive scanner and alias extractor, not a complete parser.
 - Key files and SQLite metadata cannot be committed atomically across a crash.
-- Remote helper and archive staging currently use predictable shared `/tmp` locations or `/tmp` staging paths.
 - Remote command output and SFTP operations do not yet have one uniform bounded-output and timeout policy.
 - The local forwarding port is selected before AsyncSSH binds it, leaving a small allocation race.
 - Persistent remote alias profiles do not yet have a reset or garbage-collection API.

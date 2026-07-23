@@ -500,7 +500,12 @@ async def gateway_api(
     for name, value in environment.items():
         monkeypatch.setenv(name, value)
 
-    helper_path = tmp_path / "remote-helper.sh"
+    helper_path = localhost_ssh_server.remote_state_dir / "gateway-helper-v1.sh"
+    monkeypatch.setattr(
+        runtime_module,
+        "REMOTE_STATE_DIR",
+        str(localhost_ssh_server.remote_state_dir),
+    )
     monkeypatch.setattr(runtime_module, "HELPER_PATH", str(helper_path))
 
     app = create_app()
@@ -681,9 +686,12 @@ async def test_api_session_lifecycle_over_real_localhost_ssh(gateway_api: Gatewa
     assert session.json()["state"] == "ready"
     remote_session_id = cast(str, session.json()["id"])
     remote_session_dir = ssh.remote_state_dir.joinpath("sessions", remote_session_id)
+    remote_helper_path = ssh.remote_state_dir / "gateway-helper-v1.sh"
     profile_id = hashlib.sha256(_ALIAS.encode("utf-8")).hexdigest()
     profile_dir = ssh.remote_state_dir.joinpath("profiles", profile_id)
     assert remote_session_dir.is_dir()
+    assert remote_helper_path.is_file()
+    assert remote_helper_path.stat().st_mode & 0o777 == 0o700
     assert remote_session_dir.joinpath("logs").is_dir()
     assert not remote_session_dir.joinpath("user-data").exists()
     assert not remote_session_dir.joinpath("server-data").exists()

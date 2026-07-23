@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import posixpath
 import uuid
 from pathlib import Path
 from typing import Any, cast
+from urllib.parse import urlsplit
 
 import asyncssh
 import httpx
@@ -16,12 +18,24 @@ from vscode_gateway.models import RuntimeCapabilities, RuntimeIdentity
 from vscode_gateway.settings import Settings
 from vscode_gateway.ssh_connection import SshConnectionService
 
-HELPER_PATH = "/tmp/gateway-helper-v1.sh"
+REMOTE_STATE_DIR = ".vscode-gateway"
+HELPER_PATH = f"{REMOTE_STATE_DIR}/gateway-helper-v1.sh"
 
 
 def _helper_path() -> str:
     src = Path(__file__).parent / "remote" / "gateway-helper-v1.sh"
     return str(src.resolve())
+
+
+def _remote_archive_path(url: str) -> str:
+    filename = posixpath.basename(urlsplit(url).path)
+    if not filename or filename in (".", ".."):
+        raise GatewayError(
+            ErrorCode.RUNTIME_INSTALL_FAILED,
+            "OpenVSCode artifact URL must include a filename",
+            status_code=500,
+        )
+    return posixpath.join(REMOTE_STATE_DIR, filename)
 
 
 def _parse_json_dict(
@@ -63,6 +77,27 @@ def _check_run_result(result: asyncssh.SSHCompletedProcess, *, code: ErrorCode, 
 
 async def ensure_helper_installed(settings: Settings, conn: asyncssh.SSHClientConnection) -> None:
     local = _helper_path()
+    helper_dir = posixpath.dirname(HELPER_PATH)
+    result = await SshConnectionService.run_command(
+        conn,
+        ["mkdir", "-p", "--", helper_dir],
+        timeout=settings.subprocess_timeout,
+    )
+    _check_run_result(
+        result,
+        code=ErrorCode.SSH_UNREACHABLE,
+        what="Failed to create remote helper directory",
+    )
+    result = await SshConnectionService.run_command(
+        conn,
+        ["chmod", "700", "--", helper_dir],
+        timeout=settings.subprocess_timeout,
+    )
+    _check_run_result(
+        result,
+        code=ErrorCode.SSH_UNREACHABLE,
+        what="Failed to secure remote helper directory",
+    )
     try:
         await SshConnectionService.sftp_put(conn, local, HELPER_PATH)
     except asyncssh.SFTPError as exc:
@@ -74,10 +109,14 @@ async def ensure_helper_installed(settings: Settings, conn: asyncssh.SSHClientCo
 
     result = await SshConnectionService.run_command(
         conn,
-        ["chmod", "+x", HELPER_PATH],
+        ["chmod", "700", "--", HELPER_PATH],
         timeout=settings.subprocess_timeout,
     )
-    _check_run_result(result, code=ErrorCode.SSH_UNREACHABLE, what="Failed to chmod helper")
+    _check_run_result(
+        result,
+        code=ErrorCode.SSH_UNREACHABLE,
+        what="Failed to secure remote helper script",
+    )
 
 
 async def get_capabilities(
@@ -141,9 +180,9 @@ async def ensure_installed(
 
     local_archive = await _download_and_verify(settings, url, sha256)
 
-    remote_tmp = f"/tmp/ovs-{uuid.uuid4().hex[:12]}.tar.gz"
+    remote_archive = _remote_archive_path(url)
     try:
-        await SshConnectionService.sftp_put(conn, str(local_archive), remote_tmp)
+        await SshConnectionService.sftp_put(conn, str(local_archive), remote_archive)
     except asyncssh.SFTPError as exc:
         raise GatewayError(
             ErrorCode.RUNTIME_INSTALL_FAILED,
@@ -157,7 +196,7 @@ async def ensure_installed(
             "/bin/sh",
             HELPER_PATH,
             "runtime-install",
-            remote_tmp,
+            remote_archive,
             sha256,
             settings.openvscode_version,
         ],

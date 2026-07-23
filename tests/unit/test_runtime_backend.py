@@ -13,6 +13,7 @@ import pytest
 from tests.unit.ssh_backend_test_helpers import make_settings
 from vscode_gateway import runtime as runtime_module
 from vscode_gateway.errors import ErrorCode, GatewayError
+from vscode_gateway.models import RuntimeCapabilities
 from vscode_gateway.runtime import RuntimeService
 from vscode_gateway.ssh_connection import SshConnectionService
 
@@ -50,6 +51,134 @@ def _install_result(
 
 def _connection() -> asyncssh.SSHClientConnection:
     return cast(asyncssh.SSHClientConnection, object())
+
+
+@pytest.mark.asyncio
+async def test_helper_is_uploaded_to_private_remote_state_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    commands: list[list[str]] = []
+    uploads: list[tuple[str, str]] = []
+
+    async def _run_command(
+        conn: asyncssh.SSHClientConnection,
+        argv: list[str],
+        *,
+        timeout: float,
+        stdin: bytes | None = None,
+    ) -> asyncssh.SSHCompletedProcess:
+        del conn, timeout, stdin
+        commands.append(argv)
+        return cast(
+            asyncssh.SSHCompletedProcess,
+            _CompletedProcess(exit_status=0, stdout=b""),
+        )
+
+    async def _sftp_put(
+        conn: asyncssh.SSHClientConnection,
+        local_path: str,
+        remote_path: str,
+    ) -> None:
+        del conn
+        uploads.append((local_path, remote_path))
+
+    monkeypatch.setattr(SshConnectionService, "run_command", staticmethod(_run_command))
+    monkeypatch.setattr(SshConnectionService, "sftp_put", staticmethod(_sftp_put))
+    settings = make_settings(tmp_path)
+
+    await runtime_module.ensure_helper_installed(settings, _connection())
+
+    assert commands == [
+        ["mkdir", "-p", "--", ".vscode-gateway"],
+        ["chmod", "700", "--", ".vscode-gateway"],
+        [
+            "chmod",
+            "700",
+            "--",
+            ".vscode-gateway/gateway-helper-v1.sh",
+        ],
+    ]
+    assert len(uploads) == 1
+    assert Path(uploads[0][0]).name == "gateway-helper-v1.sh"
+    assert uploads[0][1] == ".vscode-gateway/gateway-helper-v1.sh"
+
+
+@pytest.mark.asyncio
+async def test_runtime_archive_uses_github_filename_in_remote_state_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = make_settings(tmp_path)
+    settings.openvscode_version = "9.9.9"
+    settings.openvscode_linux_x64_url = (
+        "https://github.com/gitpod-io/openvscode-server/releases/download/"
+        "openvscode-server-v9.9.9/openvscode-server-v9.9.9-linux-x64.tar.gz?download=1"
+    )
+    settings.openvscode_linux_x64_sha256 = "a" * 64
+    local_archive = tmp_path / "cached-by-digest.tar.gz"
+    local_archive.write_bytes(b"archive")
+    commands: list[list[str]] = []
+    uploads: list[tuple[str, str]] = []
+
+    async def _capabilities(
+        settings: object,
+        conn: asyncssh.SSHClientConnection,
+    ) -> RuntimeCapabilities:
+        del settings, conn
+        return RuntimeCapabilities(
+            platform="linux",
+            arch="x86_64",
+            helper_version="1",
+            available=True,
+        )
+
+    async def _download(
+        settings: object,
+        url: str,
+        expected_sha256: str,
+    ) -> Path:
+        del settings, url, expected_sha256
+        return local_archive
+
+    async def _run_command(
+        conn: asyncssh.SSHClientConnection,
+        argv: list[str],
+        *,
+        timeout: float,
+        stdin: bytes | None = None,
+    ) -> asyncssh.SSHCompletedProcess:
+        del conn, timeout, stdin
+        commands.append(argv)
+        stdout = b'{"installed":false}' if "runtime-inspect" in argv else b'{"installed":true}'
+        return cast(
+            asyncssh.SSHCompletedProcess,
+            _CompletedProcess(exit_status=0, stdout=stdout),
+        )
+
+    async def _sftp_put(
+        conn: asyncssh.SSHClientConnection,
+        local_path: str,
+        remote_path: str,
+    ) -> None:
+        del conn
+        uploads.append((local_path, remote_path))
+
+    monkeypatch.setattr(runtime_module, "get_capabilities", _capabilities)
+    monkeypatch.setattr(runtime_module, "_download_and_verify", _download)
+    monkeypatch.setattr(SshConnectionService, "run_command", staticmethod(_run_command))
+    monkeypatch.setattr(SshConnectionService, "sftp_put", staticmethod(_sftp_put))
+
+    await runtime_module.ensure_installed(settings, _connection(), "linux")
+
+    remote_archive = ".vscode-gateway/openvscode-server-v9.9.9-linux-x64.tar.gz"
+    assert uploads == [(str(local_archive), remote_archive)]
+    assert commands[-1] == [
+        "/bin/sh",
+        runtime_module.HELPER_PATH,
+        "runtime-install",
+        remote_archive,
+        "a" * 64,
+        "9.9.9",
+    ]
 
 
 @pytest.mark.asyncio
