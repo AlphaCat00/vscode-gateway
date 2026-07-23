@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import fcntl
 import os
 from pathlib import Path
@@ -22,6 +23,8 @@ from vscode_gateway.lockfile import (
 )
 from vscode_gateway.readiness import Readiness, ReadinessPhase
 from vscode_gateway.settings import Settings
+
+_WORKER_ENV_VARS = ("UVICORN_WORKERS", "WEB_CONCURRENCY")
 
 
 def _settings(tmp_path: Path) -> Settings:
@@ -109,6 +112,34 @@ def test_symlink_lock_path_rejected(tmp_path: Path) -> None:
     with pytest.raises(LockAcquisitionError) as excinfo:
         ProcessLock(state_dir).acquire()
     assert "symlink" in str(excinfo.value).lower()
+
+
+def test_acquire_closes_descriptor_when_flock_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    closed: list[int] = []
+    real_close = os.close
+
+    def _fail_flock(fd: int, operation: int) -> None:
+        raise OSError(errno.EIO, "flock failed")
+
+    def _record_close(fd: int) -> None:
+        closed.append(fd)
+        real_close(fd)
+
+    monkeypatch.setattr(fcntl, "flock", _fail_flock)
+    monkeypatch.setattr(os, "close", _record_close)
+
+    lock = ProcessLock(state_dir)
+    with pytest.raises(LockAcquisitionError):
+        lock.acquire()
+
+    assert not lock.is_held
+    assert len(closed) == 1
+    with pytest.raises(OSError):
+        os.fstat(closed[0])
 
 
 def test_missing_state_dir_rejected(tmp_path: Path) -> None:
@@ -261,74 +292,31 @@ def test_lifespan_skips_recovery_when_ssh_config_is_invalid(
 def test_check_multi_worker_env_passes_with_one(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("UVICORN_WORKERS", raising=False)
-    monkeypatch.delenv("WEB_CONCURRENCY", raising=False)
+    for var in _WORKER_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("UVICORN_WORKERS", "1")
     check_multi_worker_env()
 
 
-def test_check_multi_worker_env_rejects_uvicorn_workers(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    ("env_var", "workers"),
+    [("UVICORN_WORKERS", "4"), ("WEB_CONCURRENCY", "2")],
+)
+def test_check_multi_worker_env_rejects_multiple_workers(
+    monkeypatch: pytest.MonkeyPatch, env_var: str, workers: str
 ) -> None:
-    monkeypatch.setenv("UVICORN_WORKERS", "4")
+    for var in _WORKER_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv(env_var, workers)
     with pytest.raises(LockAcquisitionError) as excinfo:
         check_multi_worker_env()
-    assert "UVICORN_WORKERS" in str(excinfo.value)
-
-
-def test_check_multi_worker_env_rejects_web_concurrency(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv("UVICORN_WORKERS", raising=False)
-    monkeypatch.setenv("WEB_CONCURRENCY", "2")
-    with pytest.raises(LockAcquisitionError):
-        check_multi_worker_env()
+    assert env_var in str(excinfo.value)
 
 
 def test_check_multi_worker_env_ignores_non_numeric_value(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    for var in _WORKER_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("UVICORN_WORKERS", "auto")
     check_multi_worker_env()
-
-
-# ---------------------------------------------------------------------------
-# create_app integration: second create_app against same state dir fails
-# ---------------------------------------------------------------------------
-
-
-def test_create_app_refuses_second_instance_via_lifespan(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Two lifespans against the same state directory: the first holds
-    the lock for its whole lifetime, the second must fail fast and mark
-    readiness degraded."""
-    from vscode_gateway.app import create_app
-
-    state_dir = tmp_path / "state"
-    monkeypatch.setenv("VSC_GATEWAY_STATE_DIR", str(state_dir))
-    monkeypatch.setenv("VSC_GATEWAY_RUNTIME_DIR", str(tmp_path / "runtime"))
-    monkeypatch.setenv("VSC_GATEWAY_SSH_DIR", str(tmp_path / "ssh"))
-    monkeypatch.setenv("VSC_GATEWAY_SSH_CONFIG_PATH", str(tmp_path / "ssh" / "config"))
-    monkeypatch.setenv("VSC_GATEWAY_SSH_KNOWN_HOSTS_PATH", str(tmp_path / "ssh" / "known_hosts"))
-    monkeypatch.setenv("VSC_GATEWAY_SSH_KEYS_DIR", str(tmp_path / "ssh" / "keys"))
-    monkeypatch.setenv("VSC_GATEWAY_PASSWORD_HASH_PATH", str(state_dir / "pw.hash"))
-    monkeypatch.setenv("VSC_GATEWAY_SESSION_SECRET_PATH", str(state_dir / "sess.secret"))
-    monkeypatch.setenv("VSC_GATEWAY_SECURE_COOKIES", "false")
-    monkeypatch.delenv("UVICORN_WORKERS", raising=False)
-    monkeypatch.delenv("WEB_CONCURRENCY", raising=False)
-
-    app1 = create_app()
-
-    async def _drive_first() -> None:
-        async with lifespan(app1):
-            # The first app is legitimately holding the lock.
-            first_lock: ProcessLock = app1.state.process_lock  # type: ignore[assignment]
-            assert first_lock.is_held
-
-            # A second lifespan against the same state dir fails fast.
-            app2 = create_app()
-            with pytest.raises(LockAcquisitionError):
-                ProcessLock(app2.state.settings.state_dir).acquire()
-
-    asyncio.run(_drive_first())

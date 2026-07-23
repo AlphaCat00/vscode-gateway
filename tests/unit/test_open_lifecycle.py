@@ -7,13 +7,10 @@ and the shielding of the final ``mark_ready`` transaction.
 """
 
 # pyright: reportPrivateUsage=false
-
 from __future__ import annotations
 
 import asyncio
 import uuid
-from collections.abc import AsyncIterator
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
@@ -21,149 +18,55 @@ import aiosqlite
 import asyncssh
 import pytest
 
+from tests.support.session_harness import (
+    FakeConnectionService as _FakeConnectionService,
+)
+from tests.support.session_harness import (
+    FakeListener as _FakeListener,
+)
+from tests.support.session_harness import (
+    install_happy_open_stubs as _install_happy_open_stubs,
+)
+from tests.support.session_harness import (
+    make_catalog,
+    make_session_service,
+    make_settings,
+)
 from vscode_gateway import sessions as sessions_mod
 from vscode_gateway.db import (
     get_session,
     insert_session,
-    open_database,
-    run_migrations,
 )
 from vscode_gateway.db import (
     mark_ready as db_mark_ready,
 )
 from vscode_gateway.errors import ErrorCode, GatewayError
-from vscode_gateway.host_trust import HostTrustService
 from vscode_gateway.models import (
-    CatalogSnapshot,
-    HostKeyRole,
-    RuntimeCapabilities,
     RuntimeIdentity,
     SessionId,
     SessionRecord,
     SessionStage,
     SessionState,
 )
-from vscode_gateway.proxy import ProxyRegistry
 from vscode_gateway.runtime import RuntimeService
 from vscode_gateway.sessions import SessionService
 from vscode_gateway.settings import Settings
 from vscode_gateway.ssh_config import SshCatalog
-from vscode_gateway.ssh_connection import (
-    SshConnection,
-    SshConnectionService,
-    _HostKeyCapturer,
-)
-
-
-def _make_settings(tmp_path: Path, *, capacity: int = 10) -> Settings:
-    return Settings(
-        state_dir=tmp_path / "state",
-        runtime_dir=tmp_path / "runtime",
-        ssh_dir=tmp_path / "ssh",
-        ssh_config_path=tmp_path / "ssh" / "config",
-        ssh_known_hosts_path=tmp_path / "ssh" / "known_hosts",
-        ssh_keys_dir=tmp_path / "ssh" / "keys",
-        password_hash_path=tmp_path / "state" / "password.hash",
-        session_secret_path=tmp_path / "state" / "session.secret",
-        session_capacity=capacity,
-    )
-
-
-@pytest.fixture
-async def db(tmp_path: Path) -> AsyncIterator[aiosqlite.Connection]:
-    conn = await open_database(tmp_path / "test.db")
-    migrations_dir = Path(__file__).parent.parent.parent / "src" / "vscode_gateway" / "migrations"
-    await run_migrations(conn, migrations_dir)
-    yield conn
-    await conn.close()
 
 
 @pytest.fixture
 def settings(tmp_path: Path) -> Settings:
-    return _make_settings(tmp_path, capacity=4)
+    return make_settings(tmp_path, capacity=4)
 
 
 @pytest.fixture
 def catalog(settings: Settings) -> SshCatalog:
-    cat = SshCatalog(settings)
-    cat.set_snapshot(
-        CatalogSnapshot(
-            revision="rev",
-            aliases=("host-a",),
-            loaded_at=datetime.now(UTC),
-        )
-    )
-    return cat
+    return make_catalog(settings, ("host-a",))
 
 
 @pytest.fixture
 def runtime(settings: Settings) -> RuntimeService:
     return RuntimeService(settings)
-
-
-class _FakeConnectionHandle:
-    def __init__(self) -> None:
-        self.closed = False
-        self.waited = False
-
-    def close(self) -> None:
-        self.closed = True
-
-    async def wait_closed(self) -> None:
-        self.waited = True
-
-
-class _FakeListener:
-    def __init__(self) -> None:
-        self.closed = False
-        self.waited = False
-        self._closed = asyncio.Event()
-
-    def close(self) -> None:
-        self.closed = True
-        self._closed.set()
-
-    async def wait_closed(self) -> None:
-        await self._closed.wait()
-        self.waited = True
-
-
-class _FakeConnectionService(SshConnectionService):
-    def __init__(self) -> None:
-        self.connections: list[SshConnection] = []
-        self.listeners: list[_FakeListener] = []
-
-    async def connect_for_session(
-        self,
-        *,
-        session_id: SessionId,
-        alias: str,
-        role: HostKeyRole = "target",
-    ) -> SshConnection:
-        del session_id, role
-        handle = _FakeConnectionHandle()
-        connection = SshConnection(
-            conn=cast(asyncssh.SSHClientConnection, handle),
-            listener=None,
-            local_port=0,
-            remote_port=0,
-            alias=alias,
-            capturer=_HostKeyCapturer(),
-        )
-        self.connections.append(connection)
-        return connection
-
-    async def forward_local_port(
-        self,
-        ssh_conn: SshConnection,
-        remote_port: int,
-    ) -> tuple[asyncssh.SSHListener, int]:
-        listener = _FakeListener()
-        self.listeners.append(listener)
-        ssh_conn.listener = cast(asyncssh.SSHListener, listener)
-        ssh_conn.local_port = 54321
-        ssh_conn.remote_port = remote_port
-        return cast(asyncssh.SSHListener, listener), 54321
 
 
 @pytest.fixture
@@ -179,103 +82,7 @@ def service(
     runtime: RuntimeService,
     connection_service: _FakeConnectionService,
 ) -> SessionService:
-    return SessionService(
-        settings,
-        db,
-        catalog,
-        runtime,
-        ProxyRegistry(),
-        connection_service,
-        HostTrustService(settings, db),
-    )
-
-
-def _install_happy_open_stubs(
-    monkeypatch: pytest.MonkeyPatch,
-    *,
-    remote: RuntimeIdentity | None = None,
-    health_ok: bool = True,
-) -> dict[str, Any]:
-    """Install fakes for every ``_do_open`` dependency except ``mark_ready``.
-
-    Returns a state dict the test can inspect (stop calls, ...).
-    """
-
-    state: dict[str, Any] = {
-        "stop_calls": list[SessionId](),
-        "remove_calls": list[SessionId](),
-        "verify_calls": list[int](),
-    }
-
-    async def _capabilities(
-        self: RuntimeService, connection: asyncssh.SSHClientConnection
-    ) -> RuntimeCapabilities:
-        del connection
-        return RuntimeCapabilities(
-            platform="linux", arch="x64", helper_version="v1", available=True
-        )
-
-    async def _ensure_installed(
-        self: RuntimeService, connection: asyncssh.SSHClientConnection, platform: str
-    ) -> None:
-        del connection, platform
-        return None
-
-    async def _start_session(
-        self: RuntimeService,
-        connection: asyncssh.SSHClientConnection,
-        session_id: SessionId,
-        alias: str,
-    ) -> RuntimeIdentity:
-        del connection, session_id, alias
-        return remote or RuntimeIdentity(
-            pid=4242,
-            port=9876,
-            boot_id="boot-abc",
-            process_start_id="psid-xyz",
-            executable="/opt/openvscode/node",
-            session_dir="/tmp/ovs",
-        )
-
-    async def _stop_session(
-        self: RuntimeService, connection: asyncssh.SSHClientConnection, session_id: SessionId
-    ) -> bool:
-        del connection
-        state["stop_calls"].append(session_id)
-        return True
-
-    async def _remove_session(
-        self: RuntimeService, connection: asyncssh.SSHClientConnection, session_id: SessionId
-    ) -> bool:
-        del connection
-        state["remove_calls"].append(session_id)
-        return True
-
-    async def _inspect_session(
-        self: RuntimeService,
-        connection: asyncssh.SSHClientConnection,
-        session_id: SessionId,
-    ) -> dict[str, Any]:
-        del connection, session_id
-        return {"running": False}
-
-    async def _verify(self: SessionService, session_id: SessionId, local_port: int) -> None:
-        state["verify_calls"].append(local_port)
-        if not health_ok:
-            raise GatewayError(
-                ErrorCode.EDITOR_UNHEALTHY,
-                "Editor unhealthy (stub)",
-                status_code=502,
-            )
-
-    monkeypatch.setattr(RuntimeService, "capabilities", _capabilities)
-    monkeypatch.setattr(RuntimeService, "ensure_installed", _ensure_installed)
-    monkeypatch.setattr(RuntimeService, "start_session", _start_session)
-    monkeypatch.setattr(RuntimeService, "stop_session", _stop_session)
-    monkeypatch.setattr(RuntimeService, "remove_session", _remove_session)
-    monkeypatch.setattr(RuntimeService, "inspect_session", _inspect_session)
-    monkeypatch.setattr(SessionService, "_verify_editor_health", _verify)
-    return state
+    return make_session_service(settings, db, catalog, runtime, connection_service)
 
 
 # ---------------------------------------------------------------------------
@@ -324,7 +131,7 @@ async def test_runtime_error_marks_internal_error_row(
     assert len(service._capacity_owned) == 1
 
     assert service._tunnels.get(sid) is None
-    assert state["stop_calls"] == []
+    assert state.stop_calls == []
     assert service._registry.lookup(sid) is None
 
 
@@ -429,7 +236,7 @@ async def test_cancel_after_remote_triggers_cleanup_and_reraises(
     assert row is not None
     assert row.state == SessionState.ERROR
     assert row.error_code == ErrorCode.INTERNAL_ERROR.value
-    assert state["stop_calls"] == [sid]
+    assert state.stop_calls == [sid]
     assert service._tunnels.get(sid) is None
     assert service._registry.lookup(sid) is None
     assert sid in service._capacity_owned

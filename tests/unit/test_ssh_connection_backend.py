@@ -655,7 +655,6 @@ async def test_local_forward_uses_loopback_and_records_listener(
     assert ssh_connection.listener is fake_connection.listener
     assert ssh_connection.local_port == 41234
     assert ssh_connection.remote_port == 8765
-    assert ssh_connection.tunnel_pid == 0
 
 
 @pytest.mark.asyncio

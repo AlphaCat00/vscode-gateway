@@ -81,7 +81,7 @@ async def ensure_helper_installed(settings: Settings, conn: asyncssh.SSHClientCo
     result = await SshConnectionService.run_command(
         conn,
         ["mkdir", "-p", "--", helper_dir],
-        timeout=settings.subprocess_timeout,
+        timeout=settings.remote_command_timeout,
     )
     _check_run_result(
         result,
@@ -91,7 +91,7 @@ async def ensure_helper_installed(settings: Settings, conn: asyncssh.SSHClientCo
     result = await SshConnectionService.run_command(
         conn,
         ["chmod", "700", "--", helper_dir],
-        timeout=settings.subprocess_timeout,
+        timeout=settings.remote_command_timeout,
     )
     _check_run_result(
         result,
@@ -110,7 +110,7 @@ async def ensure_helper_installed(settings: Settings, conn: asyncssh.SSHClientCo
     result = await SshConnectionService.run_command(
         conn,
         ["chmod", "700", "--", HELPER_PATH],
-        timeout=settings.subprocess_timeout,
+        timeout=settings.remote_command_timeout,
     )
     _check_run_result(
         result,
@@ -126,7 +126,7 @@ async def get_capabilities(
     result = await SshConnectionService.run_command(
         conn,
         ["/bin/sh", HELPER_PATH, "capabilities"],
-        timeout=settings.subprocess_timeout,
+        timeout=settings.remote_command_timeout,
     )
     _check_run_result(result, code=ErrorCode.SSH_UNREACHABLE, what="SSH probe failed")
     data = _parse_json_dict(result.stdout)
@@ -170,7 +170,7 @@ async def ensure_installed(
     result = await SshConnectionService.run_command(
         conn,
         ["/bin/sh", HELPER_PATH, "runtime-inspect", sha256, settings.openvscode_version],
-        timeout=settings.subprocess_timeout,
+        timeout=settings.remote_command_timeout,
     )
     _check_run_result(result, code=ErrorCode.REMOTE_UNSUPPORTED, what="runtime-inspect failed")
 
@@ -200,7 +200,7 @@ async def ensure_installed(
             sha256,
             settings.openvscode_version,
         ],
-        timeout=settings.subprocess_timeout * 2,
+        timeout=settings.remote_command_timeout * 2,
     )
     if result.exit_status is None or result.exit_status != 0:
         raise GatewayError(
@@ -301,7 +301,7 @@ async def inspect_session(
     result = await SshConnectionService.run_command(
         conn,
         ["/bin/sh", HELPER_PATH, "session-inspect", str(session_id)],
-        timeout=settings.subprocess_timeout,
+        timeout=settings.remote_command_timeout,
     )
     _check_run_result(
         result,
@@ -359,7 +359,7 @@ async def remove_session(
     result = await SshConnectionService.run_command(
         conn,
         ["/bin/sh", HELPER_PATH, "session-remove", str(session_id)],
-        timeout=settings.subprocess_timeout,
+        timeout=settings.remote_command_timeout,
     )
     _check_run_result(result, code=ErrorCode.STOP_FAILED, what="Remote session removal failed")
     data = _parse_json_dict(result.stdout)
@@ -385,7 +385,7 @@ async def list_sessions(
     result = await SshConnectionService.run_command(
         conn,
         ["/bin/sh", HELPER_PATH, "session-list"],
-        timeout=settings.subprocess_timeout,
+        timeout=settings.remote_command_timeout,
     )
     _check_run_result(result, code=ErrorCode.RECOVERY_FAILED, what="Remote session list failed")
     data = _parse_json_dict(result.stdout)

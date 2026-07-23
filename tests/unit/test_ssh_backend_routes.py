@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -19,7 +20,9 @@ from tests.unit.ssh_backend_test_helpers import (
     make_settings,
     migrated_database,
 )
+from vscode_gateway.app import gateway_error_handler
 from vscode_gateway.auth import hash_password
+from vscode_gateway.errors import ErrorCode, GatewayError
 from vscode_gateway.host_trust import HostTrustService
 from vscode_gateway.models import CatalogSnapshot, SessionState
 from vscode_gateway.proxy import ProxyAdapter, ProxyRegistry
@@ -67,7 +70,7 @@ async def _route_app(
         trust_service,
     )
     readiness = Readiness()
-    await readiness.mark_ready()
+    readiness.mark_ready()
 
     app = FastAPI(
         middleware=[
@@ -81,6 +84,7 @@ async def _route_app(
     app.state.settings = settings
     app.state.readiness = readiness
     app.state.db = database
+    app.add_exception_handler(GatewayError, gateway_error_handler)
     app.include_router(
         create_routes(
             settings,
@@ -88,12 +92,42 @@ async def _route_app(
             catalog,
             proxy_adapter,
             registry,
-            readiness,
             key_service=key_service,
             host_trust_service=trust_service,
         )
     )
     return app, upstream_client
+
+
+@pytest.mark.asyncio
+async def test_global_gateway_error_handler_problem_contract() -> None:
+    app = FastAPI()
+    app.add_exception_handler(GatewayError, gateway_error_handler)
+
+    @app.get("/error")
+    async def error_route() -> None:
+        raise GatewayError(
+            ErrorCode.ALIAS_NOT_FOUND,
+            "Alias is unavailable",
+            status_code=409,
+            detail="The requested alias is unavailable",
+        )
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.get("/error")
+
+    assert response.status_code == 409
+    assert response.headers["content-type"] == "application/problem+json"
+    body = response.json()
+    assert body["type"] == "urn:vscode-gateway:error:alias_not_found"
+    assert body["title"] == "Alias is unavailable"
+    assert body["detail"] == "The requested alias is unavailable"
+    assert body["code"] == "alias_not_found"
+    assert body["status"] == 409
+    request_id = body["requestId"]
+    assert isinstance(request_id, str)
+    uuid.UUID(request_id)
 
 
 @pytest.mark.asyncio

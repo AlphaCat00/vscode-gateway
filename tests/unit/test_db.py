@@ -107,7 +107,6 @@ async def test_session_recovery_transitions_existing_row_to_ready(
         error_code="tunnel_lost",
         error_message="network failed",
         local_port=12345,
-        tunnel_pid=0,
     )
     await insert_session(db, record)
 
@@ -116,7 +115,6 @@ async def test_session_recovery_transitions_existing_row_to_ready(
     assert recovering is not None
     assert recovering.stage == SessionStage.RECOVER
     assert recovering.local_port is None
-    assert recovering.tunnel_pid is None
 
     assert (
         await complete_session_recovery(

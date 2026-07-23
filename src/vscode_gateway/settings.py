@@ -55,7 +55,7 @@ class Settings(BaseSettings):
     stop_timeout: float = Field(default=60.0, ge=5.0)
     proxy_read_timeout: float = Field(default=300.0, ge=5.0)
     proxy_connect_timeout: float = Field(default=30.0, ge=1.0)
-    subprocess_timeout: float = Field(default=60.0, ge=5.0)
+    remote_command_timeout: float = Field(default=60.0, ge=5.0)
     ssh_connect_timeout: float = Field(default=15.0, ge=1.0)
 
     disconnect_grace_period: float = Field(default=300.0, ge=0.0)

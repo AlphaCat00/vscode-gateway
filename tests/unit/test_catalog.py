@@ -1,5 +1,7 @@
 """Tests for SSH catalog and alias discovery."""
 
+import pytest
+
 from vscode_gateway.ssh_config import compute_config_revision, discover_aliases
 
 
@@ -16,43 +18,14 @@ Host another-host
     assert "another-host" in aliases
 
 
-def test_discover_aliases_excludes_wildcard() -> None:
-    config = """
-Host *
-    HostName fallback.example.com
-
-Host real-host
-    HostName real.example.com
-"""
-    aliases = discover_aliases(config)
-    assert "*" not in aliases
-    assert "real-host" in aliases
-
-
-def test_discover_aliases_excludes_negated() -> None:
-    config = """
-Host !excluded
-    HostName nowhere
-
-Host real-host
-    HostName real.example.com
-"""
-    aliases = discover_aliases(config)
-    assert "!excluded" not in aliases
-    assert "real-host" in aliases
-
-
-def test_discover_aliases_excludes_wildcard_chars() -> None:
-    config = """
-Host foo*
-Host bar?
-Host baz[1-3]
+@pytest.mark.parametrize("pattern", ["*", "!excluded", "foo*", "bar?", "baz[1-3]"])
+def test_discover_aliases_excludes_nonliteral_patterns(pattern: str) -> None:
+    config = f"""
+Host {pattern}
 Host valid
 """
     aliases = discover_aliases(config)
-    assert "foo*" not in aliases
-    assert "bar?" not in aliases
-    assert "baz[1-3]" not in aliases
+    assert pattern not in aliases
     assert "valid" in aliases
 
 

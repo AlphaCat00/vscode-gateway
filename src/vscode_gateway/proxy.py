@@ -35,13 +35,18 @@ GATEWAY_REQUEST_HEADER_BLOCKLIST: frozenset[str] = frozenset(
     }
 )
 
+# Request bodies are streamed, so let httpx choose the transfer framing instead
+# of forwarding hop-by-hop, gateway-only, or downstream Content-Length headers.
+REQUEST_HEADER_BLOCKLIST: frozenset[str] = (
+    HOP_BY_HOP_HEADERS | GATEWAY_REQUEST_HEADER_BLOCKLIST | frozenset({"content-length"})
+)
+
 GATEWAY_COOKIE_NAMES: frozenset[str] = frozenset({"gateway_session"})
 
 
 class ProxyRegistry:
     def __init__(self) -> None:
         self._targets: dict[SessionId, int] = {}
-        self._lock = asyncio.Lock()
 
     def add(self, session_id: SessionId, local_port: int) -> None:
         if session_id in self._targets:
@@ -113,15 +118,7 @@ class ProxyAdapter:
         # downstream `Cookie` plus other repeated headers are preserved.
         for key, value in headers.items():
             lk = key.lower()
-            if lk in HOP_BY_HOP_HEADERS:
-                continue
-            if lk in GATEWAY_REQUEST_HEADER_BLOCKLIST:
-                continue
-            # httpx recomputes Content-Length or uses chunked encoding
-            # based on the streamed request body; the downstream value
-            # could conflict with the chosen transfer encoding and must
-            # not be forwarded.
-            if lk == "content-length":
+            if lk in REQUEST_HEADER_BLOCKLIST:
                 continue
             if lk == "cookie":
                 value = self._strip_gateway_cookies(value)
@@ -175,13 +172,9 @@ class ProxyAdapter:
         session_id: SessionId,
         request: Request,
     ) -> StreamingResponse:
-        port = self._registry.get(session_id)
         path = self._strip_base_trailing_slash(session_id, request.url.path)
         query = request.url.query
-
-        upstream_url = f"http://127.0.0.1:{port}{path}"
-        if query:
-            upstream_url = f"{upstream_url}?{query}"
+        upstream_url = self.get_upstream_url(session_id, path, query)
 
         method = request.method or "GET"
 

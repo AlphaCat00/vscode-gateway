@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from collections.abc import Awaitable, Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 from urllib.parse import urlparse
 
 import aiosqlite
@@ -22,6 +25,7 @@ from vscode_gateway.db import open_database, run_migrations
 from vscode_gateway.errors import GatewayError
 from vscode_gateway.host_trust import HostTrustService
 from vscode_gateway.lockfile import ProcessLock, check_multi_worker_env
+from vscode_gateway.models import CatalogSnapshot
 from vscode_gateway.proxy import ProxyAdapter, ProxyRegistry
 from vscode_gateway.readiness import Readiness, ReadinessPhase, UnresolvedCounts
 from vscode_gateway.routes import create_routes
@@ -36,57 +40,103 @@ BackgroundTaskSet = set[asyncio.Task[None]]
 BackgroundSpawner = Callable[[Awaitable[None]], asyncio.Task[None]]
 
 
+@dataclass(slots=True)
+class _GatewayServices:
+    db: aiosqlite.Connection
+    http_client: httpx.AsyncClient
+    catalog: SshCatalog
+    catalog_snapshot: CatalogSnapshot
+    key_service: SshKeyService
+    host_trust_service: HostTrustService
+    connection_service: SshConnectionService
+    runtime: RuntimeService
+    proxy_registry: ProxyRegistry
+    session_service: SessionService
+    proxy_adapter: ProxyAdapter
+
+
 def configure_logging(settings: Settings) -> None:
     if settings.log_format == "json":
-        structlog.configure(
-            processors=[
-                structlog.stdlib.filter_by_level,
-                structlog.stdlib.add_logger_name,
-                structlog.stdlib.add_log_level,
-                structlog.stdlib.PositionalArgumentsFormatter(),
-                structlog.processors.TimeStamper(fmt="iso"),
-                structlog.processors.StackInfoRenderer(),
-                structlog.processors.format_exc_info,
-                structlog.processors.UnicodeDecoder(),
-                structlog.processors.JSONRenderer(),
-            ],
-            context_class=dict,
-            logger_factory=structlog.stdlib.LoggerFactory(),
-            wrapper_class=structlog.stdlib.BoundLogger,
-            cache_logger_on_first_use=True,
-        )
+        processors = [
+            structlog.stdlib.filter_by_level,
+            structlog.stdlib.add_logger_name,
+            structlog.stdlib.add_log_level,
+            structlog.stdlib.PositionalArgumentsFormatter(),
+            structlog.processors.TimeStamper(fmt="iso"),
+            structlog.processors.StackInfoRenderer(),
+            structlog.processors.format_exc_info,
+            structlog.processors.UnicodeDecoder(),
+            structlog.processors.JSONRenderer(),
+        ]
     else:
-        structlog.configure(
-            processors=[
-                structlog.stdlib.filter_by_level,
-                structlog.dev.ConsoleRenderer(),
-            ],
-            context_class=dict,
-            logger_factory=structlog.stdlib.LoggerFactory(),
-            wrapper_class=structlog.stdlib.BoundLogger,
-            cache_logger_on_first_use=True,
-        )
+        processors = [
+            structlog.stdlib.filter_by_level,
+            structlog.dev.ConsoleRenderer(),
+        ]
+
+    structlog.configure(
+        processors=processors,
+        context_class=dict,
+        logger_factory=structlog.stdlib.LoggerFactory(),
+        wrapper_class=structlog.stdlib.BoundLogger,
+        cache_logger_on_first_use=True,
+    )
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    settings: Settings = app.state.settings
-    logger = structlog.get_logger()
-    readiness: Readiness = app.state.readiness  # type: ignore[assignment]
+def _problem_response(
+    *,
+    status_code: int,
+    error_type: str,
+    title: object,
+    detail: object,
+    code: str,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "type": error_type,
+            "title": title,
+            "status": status_code,
+            "detail": detail,
+            "code": code,
+            "requestId": str(uuid.uuid4()),
+        },
+        media_type="application/problem+json",
+    )
 
-    bg_tasks: BackgroundTaskSet = set()
-    http_client: httpx.AsyncClient | None = None
+
+async def http_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    del request
+    http_exc = cast(HTTPException, exc)
+    return _problem_response(
+        status_code=http_exc.status_code,
+        error_type=f"urn:vscode-gateway:error:http_{http_exc.status_code}",
+        title=http_exc.detail or "HTTP error",
+        detail=http_exc.detail or "",
+        code=f"http_{http_exc.status_code}",
+    )
+
+
+async def gateway_error_handler(request: Request, exc: Exception) -> JSONResponse:
+    del request
+    gateway_exc = cast(GatewayError, exc)
+    return _problem_response(
+        status_code=gateway_exc.status_code,
+        error_type=f"urn:vscode-gateway:error:{gateway_exc.code.value}",
+        title=gateway_exc.safe_message or gateway_exc.code.value.replace("_", " ").title(),
+        detail=gateway_exc.detail or gateway_exc.safe_message,
+        code=gateway_exc.code.value,
+    )
+
+
+async def _build_services(
+    settings: Settings,
+    bg_tasks: BackgroundTaskSet,
+) -> _GatewayServices:
     db: aiosqlite.Connection | None = None
-    process_lock: ProcessLock | None = None
+    http_client: httpx.AsyncClient | None = None
     session_service: SessionService | None = None
-
-    # Startup failures leave the app degraded so /readyz remains available.
     try:
-        # Acquire the singleton lock before opening mutable services.
-        process_lock = ProcessLock(settings.state_dir)
-        process_lock.acquire()
-        app.state.process_lock = process_lock  # type: ignore[assignment]  # state is Any
-
         db = await open_database(settings.state_dir / "gateway.db")
         migrations_dir = Path(__file__).parent / "migrations"
         await run_migrations(db, migrations_dir)
@@ -106,7 +156,6 @@ async def lifespan(app: FastAPI):
 
         catalog = SshCatalog(settings)
         catalog_snapshot = await catalog.refresh()
-
         key_service = SshKeyService(settings, db)
         host_trust_service = HostTrustService(settings, db)
         connection_service = SshConnectionService(settings, key_service, host_trust_service)
@@ -122,31 +171,79 @@ async def lifespan(app: FastAPI):
             host_trust_service,
         )
         proxy_adapter = ProxyAdapter(proxy_registry, http_client, session_service)
+        session_service.bind_background(_make_spawner(bg_tasks))
+        return _GatewayServices(
+            db=db,
+            http_client=http_client,
+            catalog=catalog,
+            catalog_snapshot=catalog_snapshot,
+            key_service=key_service,
+            host_trust_service=host_trust_service,
+            connection_service=connection_service,
+            runtime=runtime,
+            proxy_registry=proxy_registry,
+            session_service=session_service,
+            proxy_adapter=proxy_adapter,
+        )
+    except BaseException:
+        if session_service is not None:
+            with suppress(Exception):
+                await session_service.shutdown()
+        if http_client is not None:
+            with suppress(Exception):
+                await http_client.aclose()
+        if db is not None:
+            with suppress(Exception):
+                await db.close()
+        raise
 
-        spawner = _make_spawner(bg_tasks)
-        session_service.bind_background(spawner)
 
-        app.state.db = db
-        app.state.catalog = catalog
-        app.state.session_service = session_service
-        app.state.http_client = http_client
-        app.state.proxy_adapter = proxy_adapter
-        app.state.proxy_registry = proxy_registry
-        app.state.runtime = runtime
-        app.state.key_service = key_service
-        app.state.host_trust_service = host_trust_service
-        app.state.connection_service = connection_service
-        app.state.bg_tasks = bg_tasks  # type: ignore[assignment]  # state is Any
+def _attach_services(
+    app: FastAPI,
+    services: _GatewayServices,
+    bg_tasks: BackgroundTaskSet,
+) -> None:
+    app.state.db = services.db
+    app.state.catalog = services.catalog
+    app.state.session_service = services.session_service
+    app.state.http_client = services.http_client
+    app.state.proxy_adapter = services.proxy_adapter
+    app.state.proxy_registry = services.proxy_registry
+    app.state.runtime = services.runtime
+    app.state.key_service = services.key_service
+    app.state.host_trust_service = services.host_trust_service
+    app.state.connection_service = services.connection_service
+    app.state.bg_tasks = bg_tasks  # type: ignore[assignment]  # state is Any
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    settings: Settings = app.state.settings
+    logger = structlog.get_logger()
+    readiness: Readiness = app.state.readiness  # type: ignore[assignment]
+
+    bg_tasks: BackgroundTaskSet = set()
+    process_lock: ProcessLock | None = None
+    services: _GatewayServices | None = None
+
+    # Startup failures leave the app degraded so /readyz remains available.
+    try:
+        # Acquire the singleton lock before opening mutable services.
+        process_lock = ProcessLock(settings.state_dir)
+        process_lock.acquire()
+        app.state.process_lock = process_lock  # type: ignore[assignment]  # state is Any
+
+        services = await _build_services(settings, bg_tasks)
+        _attach_services(app, services, bg_tasks)
 
         router = create_routes(
             settings,
-            session_service,
-            catalog,
-            proxy_adapter,
-            proxy_registry,
-            readiness,
-            key_service=key_service,
-            host_trust_service=host_trust_service,
+            services.session_service,
+            services.catalog,
+            services.proxy_adapter,
+            services.proxy_registry,
+            key_service=services.key_service,
+            host_trust_service=services.host_trust_service,
         )
         app.include_router(router)
 
@@ -159,15 +256,15 @@ async def lifespan(app: FastAPI):
             return Response(status_code=204)
 
         logger.info("running_startup_recovery")
-        await readiness.begin_recovery()
-        if catalog_snapshot.error:
-            logger.error("startup_ssh_config_invalid", error=catalog_snapshot.error)
-            await readiness.mark_degraded(
-                f"SSH config is invalid: {catalog_snapshot.error}", UnresolvedCounts()
+        readiness.begin_recovery()
+        if services.catalog_snapshot.error:
+            logger.error("startup_ssh_config_invalid", error=services.catalog_snapshot.error)
+            readiness.mark_degraded(
+                f"SSH config is invalid: {services.catalog_snapshot.error}", UnresolvedCounts()
             )
         else:
             try:
-                report = await session_service.recover_all()
+                report = await services.session_service.recover_all()
                 logger.info(
                     "startup_recovery_complete",
                     recovered=report.recovered,
@@ -181,19 +278,19 @@ async def lifespan(app: FastAPI):
                     orphaned_resources=report.orphaned_resources_remaining,
                 )
                 if unresolved.error_sessions > 0 or unresolved.orphaned_resources > 0:
-                    await readiness.mark_degraded("recovery left unresolved sessions", unresolved)
+                    readiness.mark_degraded("recovery left unresolved sessions", unresolved)
                     logger.warning(
                         "startup_recovery_degraded",
                         **unresolved.as_dict(),
                     )
                 else:
-                    await readiness.mark_ready()
+                    readiness.mark_ready()
             except Exception as exc:
                 logger.error("startup_recovery_failed", error=str(exc))
-                await readiness.mark_degraded(f"recovery failed: {exc}", UnresolvedCounts())
+                readiness.mark_degraded(f"recovery failed: {exc}", UnresolvedCounts())
     except Exception as exc:
         logger.error("startup_mandatory_failed", error=str(exc))
-        await readiness.fail(f"mandatory startup failed: {exc}")
+        readiness.fail(f"mandatory startup failed: {exc}")
 
     yield
 
@@ -202,12 +299,10 @@ async def lifespan(app: FastAPI):
         task.cancel()
     if bg_tasks:
         await asyncio.gather(*bg_tasks, return_exceptions=True)
-    if session_service is not None:
-        await session_service.shutdown()
-    if http_client is not None:
-        await http_client.aclose()
-    if db is not None:
-        await db.close()
+    if services is not None:
+        await services.session_service.shutdown()
+        await services.http_client.aclose()
+        await services.db.close()
     if process_lock is not None:
         process_lock.release()
 
@@ -300,39 +395,8 @@ def create_app() -> FastAPI:
             media_type="application/problem+json" if status_code != 200 else "application/json",
         )
 
-    @app.exception_handler(HTTPException)
-    async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
-        import uuid
-
-        return JSONResponse(
-            status_code=exc.status_code,
-            content={
-                "type": f"urn:vscode-gateway:error:http_{exc.status_code}",
-                "title": exc.detail or "HTTP error",
-                "status": exc.status_code,
-                "detail": exc.detail or "",
-                "code": f"http_{exc.status_code}",
-                "requestId": str(uuid.uuid4()),
-            },
-            media_type="application/problem+json",
-        )
-
-    @app.exception_handler(GatewayError)
-    async def gateway_error_handler(request: Request, exc: GatewayError) -> JSONResponse:
-        import uuid
-
-        return JSONResponse(
-            status_code=exc.status_code,
-            content={
-                "type": f"urn:vscode-gateway:error:{exc.code.value}",
-                "title": exc.safe_message or exc.code.value.replace("_", " ").title(),
-                "status": exc.status_code,
-                "detail": exc.detail or exc.safe_message,
-                "code": exc.code.value,
-                "requestId": str(uuid.uuid4()),
-            },
-            media_type="application/problem+json",
-        )
+    app.add_exception_handler(HTTPException, http_exception_handler)
+    app.add_exception_handler(GatewayError, gateway_error_handler)
 
     logger.info("app_created")
     return app

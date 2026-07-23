@@ -1,48 +1,52 @@
 """Tests for session service logic."""
 
+from dataclasses import asdict, fields
+
 from vscode_gateway.models import (
     WorkspaceView,
 )
 
 
-def test_workspace_view_closed() -> None:
+def test_workspace_view_closed_defaults_and_serialization() -> None:
+    assert tuple(field.name for field in fields(WorkspaceView)) == (
+        "alias",
+        "state",
+        "session_id",
+        "editor_url",
+        "connected_clients",
+        "disconnect_deadline",
+        "stage",
+        "error_code",
+        "error_message",
+        "can_open",
+        "can_close",
+        "can_retry",
+        "can_force_close",
+        "has_remote_identity",
+        "catalog_missing",
+        "ssh_host_key",
+    )
+
     ws = WorkspaceView(
         alias="test-host",
         state="closed",
         can_open=True,
     )
-    assert ws.alias == "test-host"
-    assert ws.state == "closed"
-    assert ws.can_open is True
-    assert ws.can_close is False
-    assert ws.can_retry is False
-    assert ws.editor_url is None
-
-
-def test_workspace_view_ready() -> None:
-    import uuid
-
-    sid = uuid.uuid4()
-    ws = WorkspaceView(
-        alias="test-host",
-        state="ready",
-        session_id=sid,
-        editor_url=f"/editor/{sid}/",
-        can_close=True,
-    )
-    assert ws.state == "ready"
-    assert ws.editor_url == f"/editor/{sid}/"
-    assert ws.can_close is True
-
-
-def test_workspace_view_error() -> None:
-    ws = WorkspaceView(
-        alias="bad-host",
-        state="error",
-        error_code="ssh_unreachable",
-        error_message="Connection refused",
-        can_close=True,
-        can_retry=True,
-    )
-    assert ws.state == "error"
-    assert ws.can_retry is True
+    assert asdict(ws) == {
+        "alias": "test-host",
+        "state": "closed",
+        "session_id": None,
+        "editor_url": None,
+        "connected_clients": 0,
+        "disconnect_deadline": None,
+        "stage": None,
+        "error_code": None,
+        "error_message": None,
+        "can_open": True,
+        "can_close": False,
+        "can_retry": False,
+        "can_force_close": False,
+        "has_remote_identity": False,
+        "catalog_missing": False,
+        "ssh_host_key": None,
+    }

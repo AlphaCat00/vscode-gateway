@@ -308,7 +308,6 @@ class SessionService:
                     self._db,
                     str(session_id),
                     local_port,
-                    0,  # no subprocess PID
                 )
             )
             ledger.tunnel_identity_persisted = True
@@ -858,8 +857,8 @@ class SessionService:
 
     @classmethod
     def _can_close_without_remote_inspection(cls, session: SessionRecord) -> bool:
-        has_runtime_identity = cls._has_persisted_remote_identity(session) or any(
-            value is not None for value in (session.local_port, session.tunnel_pid)
+        has_runtime_identity = (
+            cls._has_persisted_remote_identity(session) or session.local_port is not None
         )
         return session.error_code in _PRE_REMOTE_FAILURE_CODES and not has_runtime_identity
 

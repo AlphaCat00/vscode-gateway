@@ -15,13 +15,10 @@ session row by session id after cancelling and awaiting the start task.
 """
 
 # pyright: reportPrivateUsage=false
-
 from __future__ import annotations
 
 import asyncio
 import uuid
-from collections.abc import AsyncIterator
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
@@ -29,95 +26,62 @@ import aiosqlite
 import asyncssh
 import pytest
 
+from tests.support.session_harness import (
+    FakeConnectionHandle as _FakeConnectionHandle,
+)
+from tests.support.session_harness import (
+    FakeConnectionService as _FakeConnectionService,
+)
+from tests.support.session_harness import (
+    FakeListener as _FakeListener,
+)
+from tests.support.session_harness import (
+    install_happy_open_stubs as _install_happy_open_stubs,
+)
+from tests.support.session_harness import (
+    make_catalog,
+    make_session_service,
+    make_settings,
+)
+from tests.support.session_harness import (
+    wait_for_capacity_release as _wait_for_capacity_release,
+)
 from vscode_gateway import sessions as sessions_mod
 from vscode_gateway.db import (
     get_session,
     insert_session,
-    open_database,
-    run_migrations,
     set_remote_identity,
     set_tunnel_identity,
 )
 from vscode_gateway.errors import ErrorCode, GatewayError
 from vscode_gateway.host_trust import HostTrustService
 from vscode_gateway.models import (
-    CatalogSnapshot,
     HostKeyRole,
-    RuntimeCapabilities,
-    RuntimeIdentity,
     SessionId,
     SessionRecord,
     SessionStage,
     SessionState,
 )
-from vscode_gateway.proxy import ProxyRegistry
 from vscode_gateway.runtime import RuntimeService
 from vscode_gateway.sessions import SessionService
 from vscode_gateway.settings import Settings
 from vscode_gateway.ssh_config import SshCatalog
-from vscode_gateway.ssh_connection import (
-    SshConnection,
-    SshConnectionService,
-    _HostKeyCapturer,
-)
-
-
-def _make_settings(tmp_path: Path, *, capacity: int = 10) -> Settings:
-    return Settings(
-        state_dir=tmp_path / "state",
-        runtime_dir=tmp_path / "runtime",
-        ssh_dir=tmp_path / "ssh",
-        ssh_config_path=tmp_path / "ssh" / "config",
-        ssh_known_hosts_path=tmp_path / "ssh" / "known_hosts",
-        ssh_keys_dir=tmp_path / "ssh" / "keys",
-        password_hash_path=tmp_path / "state" / "password.hash",
-        session_secret_path=tmp_path / "state" / "session.secret",
-        session_capacity=capacity,
-    )
-
-
-@pytest.fixture
-async def db(tmp_path: Path) -> AsyncIterator[aiosqlite.Connection]:
-    conn = await open_database(tmp_path / "test.db")
-    migrations_dir = Path(__file__).parent.parent.parent / "src" / "vscode_gateway" / "migrations"
-    await run_migrations(conn, migrations_dir)
-    yield conn
-    await conn.close()
+from vscode_gateway.ssh_connection import SshConnection, _HostKeyCapturer
 
 
 @pytest.fixture
 def settings(tmp_path: Path) -> Settings:
-    return _make_settings(tmp_path, capacity=4)
+    return make_settings(tmp_path, capacity=4)
 
 
 @pytest.fixture
 def catalog(settings: Settings) -> SshCatalog:
-    cat = SshCatalog(settings)
-    cat.set_snapshot(
-        CatalogSnapshot(
-            revision="rev",
-            aliases=("host-a",),
-            loaded_at=datetime.now(UTC),
-        )
-    )
-    return cat
+    return make_catalog(settings, ("host-a",))
 
 
 @pytest.fixture
 def runtime(settings: Settings) -> RuntimeService:
     return RuntimeService(settings)
-
-
-class _FakeConnectionHandle:
-    def __init__(self) -> None:
-        self.closed = False
-        self.waited = False
-
-    def close(self) -> None:
-        self.closed = True
-
-    async def wait_closed(self) -> None:
-        self.waited = True
 
 
 class _OrderedConnectionHandle(_FakeConnectionHandle):
@@ -137,21 +101,6 @@ class _OrderedConnectionHandle(_FakeConnectionHandle):
             raise RuntimeError("synthetic close failure")
 
 
-class _FakeListener:
-    def __init__(self) -> None:
-        self.closed = False
-        self.waited = False
-        self._closed = asyncio.Event()
-
-    def close(self) -> None:
-        self.closed = True
-        self._closed.set()
-
-    async def wait_closed(self) -> None:
-        await self._closed.wait()
-        self.waited = True
-
-
 class _ConnectionBoundListener(_FakeListener):
     def __init__(self, connection: _FakeConnectionHandle) -> None:
         super().__init__()
@@ -161,44 +110,6 @@ class _ConnectionBoundListener(_FakeListener):
         if not self.connection.closed:
             raise RuntimeError("active forwards remain until the SSH connection closes")
         await super().wait_closed()
-
-
-class _FakeConnectionService(SshConnectionService):
-    def __init__(self) -> None:
-        self.connections: list[SshConnection] = []
-        self.listeners: list[_FakeListener] = []
-
-    async def connect_for_session(
-        self,
-        *,
-        session_id: SessionId,
-        alias: str,
-        role: HostKeyRole = "target",
-    ) -> SshConnection:
-        del session_id, role
-        handle = _FakeConnectionHandle()
-        connection = SshConnection(
-            conn=cast(asyncssh.SSHClientConnection, handle),
-            listener=None,
-            local_port=0,
-            remote_port=0,
-            alias=alias,
-            capturer=_HostKeyCapturer(),
-        )
-        self.connections.append(connection)
-        return connection
-
-    async def forward_local_port(
-        self,
-        ssh_conn: SshConnection,
-        remote_port: int,
-    ) -> tuple[asyncssh.SSHListener, int]:
-        listener = _FakeListener()
-        self.listeners.append(listener)
-        ssh_conn.listener = cast(asyncssh.SSHListener, listener)
-        ssh_conn.local_port = 54321
-        ssh_conn.remote_port = remote_port
-        return cast(asyncssh.SSHListener, listener), 54321
 
 
 @pytest.fixture
@@ -214,109 +125,7 @@ def service(
     runtime: RuntimeService,
     connection_service: _FakeConnectionService,
 ) -> SessionService:
-    return SessionService(
-        settings,
-        db,
-        catalog,
-        runtime,
-        ProxyRegistry(),
-        connection_service,
-        HostTrustService(settings, db),
-    )
-
-
-def _install_happy_open_stubs(
-    monkeypatch: pytest.MonkeyPatch,
-    *,
-    remote: RuntimeIdentity | None = None,
-    health_ok: bool = True,
-) -> dict[str, Any]:
-    state: dict[str, Any] = {
-        "stop_calls": list[SessionId](),
-        "remove_calls": list[SessionId](),
-        "verify_calls": list[int](),
-    }
-
-    async def _capabilities(
-        self: RuntimeService, connection: asyncssh.SSHClientConnection
-    ) -> RuntimeCapabilities:
-        del connection
-        return RuntimeCapabilities(
-            platform="linux", arch="x64", helper_version="v1", available=True
-        )
-
-    async def _ensure_installed(
-        self: RuntimeService, connection: asyncssh.SSHClientConnection, platform: str
-    ) -> None:
-        del connection, platform
-        return None
-
-    async def _start_session(
-        self: RuntimeService,
-        connection: asyncssh.SSHClientConnection,
-        session_id: SessionId,
-        alias: str,
-    ) -> RuntimeIdentity:
-        del connection, session_id, alias
-        return remote or RuntimeIdentity(
-            pid=4242,
-            port=9876,
-            boot_id="boot-abc",
-            process_start_id="psid-xyz",
-            executable="/opt/openvscode/node",
-            session_dir="/tmp/ovs",
-        )
-
-    async def _stop_session(
-        self: RuntimeService, connection: asyncssh.SSHClientConnection, session_id: SessionId
-    ) -> bool:
-        del connection
-        state["stop_calls"].append(session_id)
-        return True
-
-    async def _remove_session(
-        self: RuntimeService, connection: asyncssh.SSHClientConnection, session_id: SessionId
-    ) -> bool:
-        del connection
-        state["remove_calls"].append(session_id)
-        return True
-
-    async def _inspect_session(
-        self: RuntimeService,
-        connection: asyncssh.SSHClientConnection,
-        session_id: SessionId,
-    ) -> dict[str, Any]:
-        del connection, session_id
-        return {"running": False}
-
-    async def _verify(self: SessionService, session_id: SessionId, local_port: int) -> None:
-        state["verify_calls"].append(local_port)
-        if not health_ok:
-            raise GatewayError(
-                ErrorCode.EDITOR_UNHEALTHY,
-                "Editor unhealthy (stub)",
-                status_code=502,
-            )
-
-    monkeypatch.setattr(RuntimeService, "capabilities", _capabilities)
-    monkeypatch.setattr(RuntimeService, "ensure_installed", _ensure_installed)
-    monkeypatch.setattr(RuntimeService, "start_session", _start_session)
-    monkeypatch.setattr(RuntimeService, "stop_session", _stop_session)
-    monkeypatch.setattr(RuntimeService, "remove_session", _remove_session)
-    monkeypatch.setattr(RuntimeService, "inspect_session", _inspect_session)
-    monkeypatch.setattr(SessionService, "_verify_editor_health", _verify)
-    return state
-
-
-async def _wait_for_capacity_release(
-    service: SessionService, sid: SessionId, timeout: float = 2.0
-) -> bool:
-    deadline = asyncio.get_event_loop().time() + timeout
-    while asyncio.get_event_loop().time() < deadline:
-        if sid not in service._capacity_owned:
-            return True
-        await asyncio.sleep(0.02)
-    return sid not in service._capacity_owned
+    return make_session_service(settings, db, catalog, runtime, connection_service)
 
 
 async def test_shutdown_awaits_listener_and_connection_close(
@@ -414,6 +223,14 @@ async def test_close_rereads_after_cancelling_start_task_and_stops_remote(
 ) -> None:
     """Close re-reads and stops identity persisted during cancellation."""
     state = _install_happy_open_stubs(monkeypatch)
+    released_ids: list[SessionId] = []
+    original_capacity_release = service._capacity_release
+
+    def _spy_capacity_release(session_id: SessionId) -> None:
+        released_ids.append(session_id)
+        original_capacity_release(session_id)
+
+    monkeypatch.setattr(service, "_capacity_release", _spy_capacity_release)
 
     wrote_identity: asyncio.Event = asyncio.Event()
 
@@ -463,7 +280,8 @@ async def test_close_rereads_after_cancelling_start_task_and_stops_remote(
 
     assert await get_session(db, str(sid)) is None
     assert service._capacity_owned == set()
-    assert state["stop_calls"] == [sid]
+    assert state.stop_calls == [sid]
+    assert released_ids == [sid]
     assert service._start_tasks.get(sid) is None
     assert task.cancelled() or task.done()
 
@@ -480,13 +298,15 @@ async def test_close_rereads_after_cancelling_start_task_and_stops_tunnel(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Close re-reads and stops a tunnel persisted during cancellation."""
-    state = _install_happy_open_stubs(monkeypatch)
+    _install_happy_open_stubs(monkeypatch)
 
     wrote_identity: asyncio.Event = asyncio.Event()
+    listener: _FakeListener | None = None
 
     async def _stub_do_open_write_on_cancel(
         self: SessionService, session_id: SessionId, alias: str
     ) -> Any:
+        nonlocal listener
         try:
             await asyncio.sleep(30)
         except asyncio.CancelledError:
@@ -498,8 +318,7 @@ async def test_close_rereads_after_cancelling_start_task_and_stops_tunnel(
                 ssh_conn=ssh_conn,
                 listener=cast(asyncssh.SSHListener, listener),
             )
-            state["listener"] = listener
-            await sessions_mod.set_tunnel_identity(db, str(session_id), 54321, 99999)
+            await sessions_mod.set_tunnel_identity(db, str(session_id), 54321)
             wrote_identity.set()
             raise
 
@@ -520,7 +339,6 @@ async def test_close_rereads_after_cancelling_start_task_and_stops_tunnel(
 
     pre = await get_session(db, str(sid))
     assert pre is not None
-    assert pre.tunnel_pid is None
 
     close_task = asyncio.create_task(service.close("host-a"))
     await asyncio.wait_for(wrote_identity.wait(), timeout=2.0)
@@ -530,7 +348,8 @@ async def test_close_rereads_after_cancelling_start_task_and_stops_tunnel(
 
     assert await get_session(db, str(sid)) is None
     assert service._capacity_owned == set()
-    assert cast(_FakeListener, state["listener"]).closed is True
+    assert listener is not None
+    assert listener.closed is True
     assert service._tunnels.get(sid) is None
 
     assert task.cancelled() or task.done()
@@ -578,7 +397,7 @@ async def test_close_after_open_cleanup_is_noop_stop_no_double_release(
     assert settled is not None
     assert settled.state == SessionState.ERROR
     assert settled.remote_pid is None
-    assert state["stop_calls"] == [sid]
+    assert state.stop_calls == [sid]
     assert sid in service._capacity_owned
 
     close_task = asyncio.create_task(service.close("host-a"))
@@ -588,7 +407,7 @@ async def test_close_after_open_cleanup_is_noop_stop_no_double_release(
 
     assert await get_session(db, str(sid)) is None
     assert service._capacity_owned == set()
-    assert state["stop_calls"] == [sid]
+    assert state.stop_calls == [sid]
 
 
 # ---------------------------------------------------------------------------
@@ -616,7 +435,7 @@ async def test_close_ready_session_stops_remote_and_tunnel(
         "psid-xyz",
         "/opt/openvscode/node",
     )
-    await set_tunnel_identity(db, str(sid), 54321, 99999)
+    await set_tunnel_identity(db, str(sid), 54321)
     service._capacity_acquire(sid)
     ssh_conn = await connection_service.connect_for_session(session_id=sid, alias="host-a")
     handle = cast(_FakeConnectionHandle, ssh_conn.conn)
@@ -637,72 +456,10 @@ async def test_close_ready_session_stops_remote_and_tunnel(
     assert listener.closed is True
     assert listener.waited is True
     assert handle.closed is True
-    assert state["stop_calls"] == [sid]
-    assert state["remove_calls"] == [sid]
+    assert state.stop_calls == [sid]
+    assert state.remove_calls == [sid]
     assert service._tunnels.get(sid) is None
     assert service._registry.lookup(sid) is None
-
-
-# ---------------------------------------------------------------------------
-# Race 5: capacity released exactly once in every close path
-# ---------------------------------------------------------------------------
-
-
-async def test_capacity_released_exactly_once_in_all_close_paths(
-    service: SessionService,
-    db: aiosqlite.Connection,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Only close releases capacity in the cancel-then-close race."""
-    state = _install_happy_open_stubs(monkeypatch)
-
-    wrote_identity: asyncio.Event = asyncio.Event()
-
-    async def _stub_do_open_write_on_cancel(
-        self: SessionService, session_id: SessionId, alias: str
-    ) -> Any:
-        try:
-            await asyncio.sleep(30)
-        except asyncio.CancelledError:
-            await sessions_mod.set_remote_identity(
-                db,
-                str(session_id),
-                4242,
-                9876,
-                "boot-abc",
-                "psid-xyz",
-                "/opt/openvscode/node",
-            )
-            wrote_identity.set()
-            raise
-
-    monkeypatch.setattr(SessionService, "_do_open", _stub_do_open_write_on_cancel)
-
-    sid = uuid.uuid4()
-    await insert_session(
-        db,
-        SessionRecord(
-            id=sid, alias="host-a", state=SessionState.STARTING, stage=SessionStage.VALIDATE
-        ),
-    )
-    service._capacity_acquire(sid)
-    assert service._capacity_owned == {sid}
-
-    task = asyncio.create_task(service._run_open(sid, "host-a"))
-    service._start_tasks[sid] = task
-    await asyncio.sleep(0.05)
-
-    close_task = asyncio.create_task(service.close("host-a"))
-    await asyncio.wait_for(wrote_identity.wait(), timeout=2.0)
-    released = await _wait_for_capacity_release(service, sid)
-    assert released
-    await close_task
-
-    assert sid not in service._capacity_owned
-    assert service._capacity_owned == set()
-    assert state["stop_calls"] == [sid]
-
-    assert task.cancelled() or task.done()
 
 
 async def test_close_host_key_failure_without_identities_does_not_reconnect(

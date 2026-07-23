@@ -1,13 +1,10 @@
 """Unit tests for session-ID-keyed capacity accounting."""
 
 # pyright: reportPrivateUsage=false
-
 from __future__ import annotations
 
-import asyncio
 import uuid
-from collections.abc import AsyncIterator, Iterator
-from datetime import UTC, datetime
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, cast
 
@@ -15,18 +12,28 @@ import aiosqlite
 import asyncssh
 import pytest
 
+from tests.support.session_harness import (
+    FakeConnectionHandle as _FakeConnectionHandle,
+)
+from tests.support.session_harness import (
+    FakeConnectionService as _FakeConnectionService,
+)
+from tests.support.session_harness import (
+    FakeListener as _FakeListener,
+)
+from tests.support.session_harness import (
+    make_catalog,
+    make_session_service,
+    make_settings,
+)
 from vscode_gateway import sessions as sessions_mod
 from vscode_gateway.db import (
     get_session,
     insert_session,
     list_sessions,
-    open_database,
-    run_migrations,
 )
 from vscode_gateway.errors import ErrorCode, GatewayError
-from vscode_gateway.host_trust import HostTrustService
 from vscode_gateway.models import (
-    CatalogSnapshot,
     HostKeyRole,
     RecoveryReport,
     SessionId,
@@ -35,122 +42,21 @@ from vscode_gateway.models import (
     SessionState,
     SessionView,
 )
-from vscode_gateway.proxy import ProxyRegistry
 from vscode_gateway.runtime import RuntimeService
 from vscode_gateway.sessions import SessionService
 from vscode_gateway.settings import Settings
 from vscode_gateway.ssh_config import SshCatalog
-from vscode_gateway.ssh_connection import (
-    SshConnection,
-    SshConnectionService,
-    _HostKeyCapturer,
-)
-
-
-def _make_settings(tmp_path: Path, *, capacity: int = 10) -> Settings:
-    return Settings(
-        state_dir=tmp_path / "state",
-        runtime_dir=tmp_path / "runtime",
-        ssh_dir=tmp_path / "ssh",
-        ssh_config_path=tmp_path / "ssh" / "config",
-        ssh_known_hosts_path=tmp_path / "ssh" / "known_hosts",
-        ssh_keys_dir=tmp_path / "ssh" / "keys",
-        password_hash_path=tmp_path / "state" / "password.hash",
-        session_secret_path=tmp_path / "state" / "session.secret",
-        session_capacity=capacity,
-    )
-
-
-@pytest.fixture
-async def db(tmp_path: Path) -> AsyncIterator[aiosqlite.Connection]:
-    conn = await open_database(tmp_path / "test.db")
-    migrations_dir = Path(__file__).parent.parent.parent / "src" / "vscode_gateway" / "migrations"
-    await run_migrations(conn, migrations_dir)
-    yield conn
-    await conn.close()
+from vscode_gateway.ssh_connection import SshConnection
 
 
 @pytest.fixture
 def settings(tmp_path: Path) -> Settings:
-    return _make_settings(tmp_path, capacity=2)
+    return make_settings(tmp_path, capacity=2)
 
 
 @pytest.fixture
 def catalog(settings: Settings) -> SshCatalog:
-    cat = SshCatalog(settings)
-    cat.set_snapshot(
-        CatalogSnapshot(
-            revision="rev",
-            aliases=("host-a", "host-b", "host-c"),
-            loaded_at=datetime.now(UTC),
-        )
-    )
-    return cat
-
-
-class _FakeConnectionHandle:
-    def __init__(self) -> None:
-        self.closed = False
-        self.waited = False
-
-    def close(self) -> None:
-        self.closed = True
-
-    async def wait_closed(self) -> None:
-        self.waited = True
-
-
-class _FakeListener:
-    def __init__(self) -> None:
-        self.closed = False
-        self.waited = False
-        self._closed = asyncio.Event()
-
-    def close(self) -> None:
-        self.closed = True
-        self._closed.set()
-
-    async def wait_closed(self) -> None:
-        await self._closed.wait()
-        self.waited = True
-
-
-class _FakeConnectionService(SshConnectionService):
-    def __init__(self) -> None:
-        self.connections: list[SshConnection] = []
-        self.listeners: list[_FakeListener] = []
-
-    async def connect_for_session(
-        self,
-        *,
-        session_id: SessionId,
-        alias: str,
-        role: HostKeyRole = "target",
-    ) -> SshConnection:
-        del session_id, role
-        handle = _FakeConnectionHandle()
-        connection = SshConnection(
-            conn=cast(asyncssh.SSHClientConnection, handle),
-            listener=None,
-            local_port=0,
-            remote_port=0,
-            alias=alias,
-            capturer=_HostKeyCapturer(),
-        )
-        self.connections.append(connection)
-        return connection
-
-    async def forward_local_port(
-        self,
-        ssh_conn: SshConnection,
-        remote_port: int,
-    ) -> tuple[asyncssh.SSHListener, int]:
-        listener = _FakeListener()
-        self.listeners.append(listener)
-        ssh_conn.listener = cast(asyncssh.SSHListener, listener)
-        ssh_conn.local_port = 54321
-        ssh_conn.remote_port = remote_port
-        return cast(asyncssh.SSHListener, listener), 54321
+    return make_catalog(settings, ("host-a", "host-b", "host-c"))
 
 
 @pytest.fixture
@@ -166,15 +72,7 @@ def service(
     runtime: RuntimeService,
     connection_service: _FakeConnectionService,
 ) -> SessionService:
-    return SessionService(
-        settings,
-        db,
-        catalog,
-        runtime,
-        ProxyRegistry(),
-        connection_service,
-        HostTrustService(settings, db),
-    )
+    return make_session_service(settings, db, catalog, runtime, connection_service)
 
 
 @pytest.fixture
@@ -221,7 +119,6 @@ def _ready_record(alias: str, sid: SessionId) -> SessionRecord:
         remote_process_start_id="start-xyz",
         remote_executable="/opt/openvscode/node",
         local_port=12345,
-        tunnel_pid=0,
     )
 
 
@@ -454,15 +351,7 @@ async def test_max_sessions_enforced_after_recovery(
 ) -> None:
     # Capacity equals the number of pre-existing rows so the next open must
     # be rejected.
-    service = SessionService(
-        settings,
-        db,
-        catalog,
-        runtime,
-        ProxyRegistry(),
-        connection_service,
-        HostTrustService(settings, db),
-    )
+    service = make_session_service(settings, db, catalog, runtime, connection_service)
 
     async def _inspect(
         self: RuntimeService, connection: asyncssh.SSHClientConnection, session_id: SessionId

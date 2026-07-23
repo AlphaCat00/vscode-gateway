@@ -193,16 +193,6 @@ def _make_registered_session(adapter: ProxyAdapter) -> uuid.UUID:
 # ---------------------------------------------------------------------------
 
 
-def test_client_has_trust_env_false_constructor_arg() -> None:
-    """Asserting ``trust_env=False``/``follow_redirects=False`` directly
-    on a freshly constructed client keeps this test independent of
-    lifespan wiring."""
-    client = httpx.AsyncClient(trust_env=False, follow_redirects=False)
-    assert client.trust_env is False
-    assert client.follow_redirects is False
-    asyncio.run(client.aclose())
-
-
 def test_app_lifespan_builds_trust_env_false_client(tmp_path: Path) -> None:
     """The lifespan-mounted ``http_client`` must have ``trust_env=False``
     so production traffic cannot be redirected by ``HTTP_PROXY`` etc."""
@@ -263,7 +253,7 @@ async def test_streaming_upload_forwarded_chunk_by_chunk() -> None:
     sid = _make_registered_session(adapter)
     # 8 MiB total body split into 8 chunks — far beyond any reasonable
     # in-memory cap, and not all materialized at once on the proxy.
-    chunks = [b"a" * (1024 * 1024) for _ in range(8)]
+    chunks = [bytes([ord("a") + index]) * (1024 * 1024) for index in range(8)]
 
     request = _build_request(
         method="POST",
@@ -282,32 +272,7 @@ async def test_streaming_upload_forwarded_chunk_by_chunk() -> None:
     assert transport.transfer_encoding == "chunked"
     assert transport.content_length is None
     assert transport.received_chunks == chunks
-    assert b"".join(transport.received_chunks) == b"a" * (1024 * 1024 * 8)
-
-    await client.aclose()
-
-
-@pytest.mark.asyncio
-async def test_streaming_upload_byte_for_byte_order() -> None:
-    """Distinct chunks retain order — proves the proxy did not rearrange
-    or coalesce body chunks."""
-    transport = _RecordingTransport()
-    adapter, client = _make_adapter(transport)
-    sid = _make_registered_session(adapter)
-
-    chunks = [b"alpha", b"beta", b"gamma", b"delta"]
-    request = _build_request(
-        method="POST",
-        path=f"/editor/{sid}/upload",
-        headers={"content-type": "application/octet-stream"},
-        body_chunks=chunks,
-    )
-
-    response = await adapter.proxy_http(sid, request)
-    await _consume_body(response)
-    await _await_response_background(response)
-
-    assert transport.received_chunks == chunks
+    assert b"".join(transport.received_chunks) == b"".join(chunks)
 
     await client.aclose()
 

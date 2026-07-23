@@ -10,6 +10,7 @@ from pathlib import Path
 import structlog
 
 LOCK_FILE_NAME = "gateway.lock"
+_WORKER_ENV_VARS = ("UVICORN_WORKERS", "WEB_CONCURRENCY")
 
 
 class LockAcquisitionError(RuntimeError):
@@ -24,12 +25,11 @@ def _errno_name(exc: OSError) -> str:
 
 
 def _validate_state_dir(state_dir: Path) -> None:
-    if not state_dir.exists():
-        msg = f"State directory {state_dir!s} does not exist; refusing to start."
-        raise LockAcquisitionError(msg)
-    if not state_dir.is_dir():
-        msg = f"State directory {state_dir!s} is not a directory; refusing to start."
-        raise LockAcquisitionError(msg)
+    if state_dir.is_dir():
+        return
+    reason = "does not exist" if not state_dir.exists() else "is not a directory"
+    msg = f"State directory {state_dir!s} {reason}; refusing to start."
+    raise LockAcquisitionError(msg)
 
 
 class ProcessLock:
@@ -64,17 +64,17 @@ class ProcessLock:
         if self._fd is not None:
             return
         _validate_state_dir(self._state_dir)
-        if self._lock_path.is_symlink():
-            logger.error(
-                "singleton_lock_symlink_rejected",
-                lock_file=str(self._lock_path),
-            )
-            msg = f"Lock file path {self._lock_path!s} is a symlink; refusing to start."
-            raise LockAcquisitionError(msg)
         flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW
         try:
             fd = os.open(self._lock_path, flags, 0o600)
         except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                logger.error(
+                    "singleton_lock_symlink_rejected",
+                    lock_file=str(self._lock_path),
+                )
+                msg = f"Lock file path {self._lock_path!s} is a symlink; refusing to start."
+                raise LockAcquisitionError(msg) from exc
             logger.error(
                 "singleton_lock_open_failed",
                 lock_file=str(self._lock_path),
@@ -140,7 +140,7 @@ def check_multi_worker_env() -> None:
     intend to run more than one worker sharing the same state directory.
     """
     logger = structlog.get_logger()
-    for var in ("UVICORN_WORKERS", "WEB_CONCURRENCY"):
+    for var in _WORKER_ENV_VARS:
         raw = os.environ.get(var)
         if not raw or not raw.strip():
             continue

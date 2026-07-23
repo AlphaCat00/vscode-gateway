@@ -96,7 +96,7 @@ async def test_readyz_returns_503_during_recovering(
     client_with_readiness: tuple[httpx.AsyncClient, Readiness],
 ) -> None:
     client, readiness = client_with_readiness
-    await readiness.begin_recovery()
+    readiness.begin_recovery()
     response = await client.get("/readyz")
     assert response.status_code == 503
     assert response.json()["phase"] == ReadinessPhase.RECOVERING.value
@@ -106,8 +106,8 @@ async def test_readyz_returns_200_after_mark_ready(
     client_with_readiness: tuple[httpx.AsyncClient, Readiness],
 ) -> None:
     client, readiness = client_with_readiness
-    await readiness.begin_recovery()
-    await readiness.mark_ready()
+    readiness.begin_recovery()
+    readiness.mark_ready()
     response = await client.get("/readyz")
     assert response.status_code == 200
     body = response.json()
@@ -119,8 +119,8 @@ async def test_readyz_returns_503_with_unresolved_counts_after_degraded(
     client_with_readiness: tuple[httpx.AsyncClient, Readiness],
 ) -> None:
     client, readiness = client_with_readiness
-    await readiness.begin_recovery()
-    await readiness.mark_degraded(
+    readiness.begin_recovery()
+    readiness.mark_degraded(
         "recovery left unresolved sessions",
         UnresolvedCounts(error_sessions=2, orphaned_resources=1),
     )
@@ -141,7 +141,7 @@ async def test_mutation_route_503_during_recovering(
     client_with_readiness: tuple[httpx.AsyncClient, Readiness],
 ) -> None:
     client, readiness = client_with_readiness
-    await readiness.begin_recovery()
+    readiness.begin_recovery()
     response = await client.post("/api/sessions/host-a/open")
     assert response.status_code == 503
 
@@ -150,7 +150,7 @@ async def test_mutation_route_503_during_degraded(
     client_with_readiness: tuple[httpx.AsyncClient, Readiness],
 ) -> None:
     client, readiness = client_with_readiness
-    await readiness.mark_degraded("mandatory failed", UnresolvedCounts())
+    readiness.mark_degraded("mandatory failed", UnresolvedCounts())
     response = await client.post("/api/sessions/host-a/open")
     assert response.status_code == 503
 
@@ -159,7 +159,7 @@ async def test_mutation_route_202_after_ready(
     client_with_readiness: tuple[httpx.AsyncClient, Readiness],
 ) -> None:
     client, readiness = client_with_readiness
-    await readiness.mark_ready()
+    readiness.mark_ready()
     response = await client.post("/api/sessions/host-a/open")
     assert response.status_code == 202
 
@@ -173,7 +173,7 @@ async def test_readonly_route_200_during_recovering(
     client_with_readiness: tuple[httpx.AsyncClient, Readiness],
 ) -> None:
     client, readiness = client_with_readiness
-    await readiness.begin_recovery()
+    readiness.begin_recovery()
     sessions = await client.get("/api/sessions")
     assert sessions.status_code == 200
     assert sessions.json() == {"workspaces": []}
@@ -187,31 +187,41 @@ async def test_readonly_route_200_during_recovering(
 # ---------------------------------------------------------------------------
 
 
-async def test_readiness_transitions_are_atomic() -> None:
+def test_readiness_transitions_replace_complete_snapshots() -> None:
     readiness = Readiness()
     assert readiness.phase == ReadinessPhase.STARTING
     assert readiness.is_ready is False
+    starting = readiness.snapshot()
 
-    await readiness.begin_recovery()
+    readiness.begin_recovery()
     assert readiness.phase == ReadinessPhase.RECOVERING
     assert readiness.is_ready is False
+    recovering = readiness.snapshot()
+    assert recovering is not starting
+    assert recovering.reason == ""
+    assert recovering.unresolved == UnresolvedCounts()
 
-    await readiness.mark_degraded("left over", UnresolvedCounts(error_sessions=1))
+    readiness.mark_degraded("left over", UnresolvedCounts(error_sessions=1))
     assert readiness.phase == ReadinessPhase.DEGRADED
-    snap = readiness.snapshot()
-    assert snap.unresolved.error_sessions == 1
+    degraded = readiness.snapshot()
+    assert degraded is not recovering
+    assert degraded.reason == "left over"
+    assert degraded.unresolved == UnresolvedCounts(error_sessions=1)
 
     # mark_ready clears prior reason/unresolved
-    await readiness.mark_ready()
+    readiness.mark_ready()
     assert readiness.is_ready is True
-    snap = readiness.snapshot()
-    assert snap.reason == ""
-    assert snap.unresolved.error_sessions == 0
+    ready = readiness.snapshot()
+    assert ready is not degraded
+    assert ready.reason == ""
+    assert ready.unresolved == UnresolvedCounts()
+    assert degraded.reason == "left over"
+    assert degraded.unresolved.error_sessions == 1
 
 
-async def test_readiness_fail_marks_degraded_with_empty_counts() -> None:
+def test_readiness_fail_marks_degraded_with_empty_counts() -> None:
     readiness = Readiness()
-    await readiness.fail("database open error")
+    readiness.fail("database open error")
     assert readiness.phase == ReadinessPhase.DEGRADED
     snap = readiness.snapshot()
     assert snap.reason == "database open error"
@@ -222,17 +232,6 @@ async def test_readiness_fail_marks_degraded_with_empty_counts() -> None:
 # ---------------------------------------------------------------------------
 # HTTPException detail transport through require_ready
 # ---------------------------------------------------------------------------
-
-
-async def test_require_ready_passes_when_ready() -> None:
-    readiness = Readiness()
-    await readiness.mark_ready()
-
-    app = _build_test_app(readiness)
-    transport = ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.post("/api/sessions/host-a/open")
-    assert response.status_code == 202
 
 
 async def test_require_ready_raises_http_exception_when_not_ready() -> None:

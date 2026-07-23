@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -16,7 +15,7 @@ class ReadinessPhase(StrEnum):
     DEGRADED = "degraded"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class UnresolvedCounts:
     error_sessions: int = 0
     orphaned_resources: int = 0
@@ -28,7 +27,10 @@ class UnresolvedCounts:
         }
 
 
-@dataclass(frozen=True)
+_EMPTY_UNRESOLVED_COUNTS = UnresolvedCounts()
+
+
+@dataclass(frozen=True, slots=True)
 class ReadinessState:
     phase: ReadinessPhase = ReadinessPhase.STARTING
     reason: str = ""
@@ -46,13 +48,12 @@ class ReadinessState:
 class Readiness:
     """Single-process readiness gate.
 
-    Transitions are awaited under a lock; reads return a frozen snapshot
-    so request handlers and observers cannot observe a torn state.
+    Transitions replace the complete frozen snapshot so request handlers and
+    observers cannot observe a torn state.
     """
 
     def __init__(self) -> None:
         self._state: ReadinessState = ReadinessState()
-        self._lock = asyncio.Lock()
 
     @property
     def phase(self) -> ReadinessPhase:
@@ -65,26 +66,20 @@ class Readiness:
     def snapshot(self) -> ReadinessState:
         return self._state
 
-    async def begin_recovery(self) -> None:
-        async with self._lock:
-            self._state = ReadinessState(phase=ReadinessPhase.RECOVERING)
+    def begin_recovery(self) -> None:
+        self._state = ReadinessState(phase=ReadinessPhase.RECOVERING)
 
-    async def mark_ready(self) -> None:
-        async with self._lock:
-            self._state = ReadinessState(phase=ReadinessPhase.READY)
+    def mark_ready(self) -> None:
+        self._state = ReadinessState(phase=ReadinessPhase.READY)
 
-    async def mark_degraded(self, reason: str, unresolved: UnresolvedCounts) -> None:
-        async with self._lock:
-            self._state = ReadinessState(
-                phase=ReadinessPhase.DEGRADED,
-                reason=reason,
-                unresolved=unresolved,
-            )
+    def mark_degraded(
+        self, reason: str, unresolved: UnresolvedCounts = _EMPTY_UNRESOLVED_COUNTS
+    ) -> None:
+        self._state = ReadinessState(
+            phase=ReadinessPhase.DEGRADED,
+            reason=reason,
+            unresolved=unresolved,
+        )
 
-    async def fail(self, reason: str) -> None:
-        async with self._lock:
-            self._state = ReadinessState(
-                phase=ReadinessPhase.DEGRADED,
-                reason=reason,
-                unresolved=UnresolvedCounts(),
-            )
+    def fail(self, reason: str) -> None:
+        self.mark_degraded(reason)

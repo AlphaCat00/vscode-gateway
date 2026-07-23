@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import uuid
 from contextlib import suppress
 from pathlib import Path
 from typing import Annotated
@@ -35,6 +34,7 @@ from vscode_gateway.models import (
     HostKeyChallenge,
     KeyUploadResponse,
     SessionState,
+    SessionView,
     SshConfigResponse,
     SshConfigUpdateRequest,
     SshKeyInventory,
@@ -85,7 +85,7 @@ async def require_csrf(request: Request) -> None:
         raise HTTPException(status_code=403, detail="Invalid CSRF token")
 
 
-def _require_ready(request: Request) -> None:
+def require_ready(request: Request) -> None:
     """Reject mutations and editor traffic while the gateway is not
     ``ready``. Read-only routes (dashboard, lists, /healthz, the
     top-level /readyz) bypass this check.
@@ -94,36 +94,13 @@ def _require_ready(request: Request) -> None:
     stop routing mutations and editors during startup and degraded
     recovery.
     """
-    try:
-        readiness: Readiness = request.app.state.readiness
-    except AttributeError:
-        raise HTTPException(status_code=503, detail="Service is not ready") from None
-    if readiness.phase != ReadinessPhase.READY:
-        state = readiness.snapshot()
-        body = state.as_response_dict()
+    readiness: Readiness | None = getattr(request.app.state, "readiness", None)
+    if readiness is None or not readiness.is_ready:
+        reason = readiness.snapshot().reason if readiness is not None else ""
         raise HTTPException(
             status_code=503,
-            detail=body.get("reason") or "Service is not ready",
+            detail=reason or "Service is not ready",
         )
-
-
-async def require_ready(request: Request) -> None:
-    _require_ready(request)
-
-
-def _problem(exc: GatewayError, request_id: str) -> JSONResponse:
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={
-            "type": f"urn:vscode-gateway:error:{exc.code.value}",
-            "title": exc.safe_message or exc.code.value.replace("_", " ").title(),
-            "status": exc.status_code,
-            "detail": exc.detail or exc.safe_message,
-            "code": exc.code.value,
-            "requestId": request_id,
-        },
-        media_type="application/problem+json",
-    )
 
 
 def _host_key_payload(challenge: HostKeyChallenge) -> dict[str, str | int]:
@@ -137,20 +114,34 @@ def _host_key_payload(challenge: HostKeyChallenge) -> dict[str, str | int]:
     }
 
 
+def _accepted_session_response(view: SessionView, status: str) -> JSONResponse:
+    return JSONResponse(
+        {
+            "alias": view.alias,
+            "status": status,
+            "session_id": str(view.id),
+        },
+        status_code=202,
+    )
+
+
 def create_routes(
     settings: Settings,
     session_service: SessionService,
     catalog: SshCatalog,
     proxy_adapter: ProxyAdapter,
     proxy_registry: ProxyRegistry,
-    readiness: Readiness,  # wired explicitly; routes read state from request.app.state
     *,
     key_service: SshKeyService,
     host_trust_service: HostTrustService,
 ) -> APIRouter:
-    _ = readiness
     router = APIRouter()
     templates = _load_templates()
+    mutation_dependencies = (
+        Depends(require_ready),
+        Depends(require_auth),
+        Depends(require_csrf),
+    )
 
     login_throttle = LoginThrottle(
         max_attempts=settings.login_max_attempts,
@@ -249,12 +240,8 @@ def create_routes(
             ws_data.append(workspace)
         return JSONResponse({"workspaces": ws_data})
 
-    @router.get("/api/sessions/{alias:path}")
-    async def get_session_by_alias_route(
-        request: Request,
-        alias: str,
-    ) -> JSONResponse:
-        await require_auth.__call__(request)
+    @router.get("/api/sessions/{alias:path}", dependencies=[Depends(require_auth)])
+    async def get_session_by_alias_route(alias: str) -> JSONResponse:
         view = await session_service.get_session_view(alias)
         if view is None:
             raise HTTPException(status_code=404, detail="Session not found")
@@ -275,59 +262,34 @@ def create_routes(
             response["sshHostKey"] = _host_key_payload(view.ssh_host_key)
         return JSONResponse(response)
 
-    @router.post("/api/sessions/{alias:path}/open", dependencies=[Depends(require_ready)])
+    @router.post(
+        "/api/sessions/{alias:path}/open",
+        dependencies=mutation_dependencies,
+    )
     async def open_session(
-        request: Request,
         alias: str,
     ) -> JSONResponse:
-        await require_auth.__call__(request)
-        await require_csrf.__call__(request)
-        try:
-            view = await session_service.open(alias)
-            return JSONResponse(
-                {
-                    "alias": view.alias,
-                    "status": "open_initiated",
-                    "session_id": str(view.id),
-                },
-                status_code=202,
-            )
-        except GatewayError as exc:
-            return _problem(exc, str(uuid.uuid4()))
+        view = await session_service.open(alias)
+        return _accepted_session_response(view, "open_initiated")
 
-    @router.post("/api/sessions/{alias:path}/close", dependencies=[Depends(require_ready)])
+    @router.post(
+        "/api/sessions/{alias:path}/close",
+        dependencies=mutation_dependencies,
+    )
     async def close_session(
-        request: Request,
         alias: str,
         force: bool = False,
     ) -> Response:
-        await require_auth.__call__(request)
-        await require_csrf.__call__(request)
-        try:
-            await session_service.close(alias, force=force)
-            return Response(status_code=204)
-        except GatewayError as exc:
-            return _problem(exc, str(uuid.uuid4()))
+        await session_service.close(alias, force=force)
+        return Response(status_code=204)
 
-    @router.post("/api/sessions/{alias:path}/retry", dependencies=[Depends(require_ready)])
-    async def retry_session(
-        request: Request,
-        alias: str,
-    ) -> JSONResponse:
-        await require_auth.__call__(request)
-        await require_csrf.__call__(request)
-        try:
-            view = await session_service.retry(alias)
-            return JSONResponse(
-                {
-                    "alias": view.alias,
-                    "status": "retry_initiated",
-                    "session_id": str(view.id),
-                },
-                status_code=202,
-            )
-        except GatewayError as exc:
-            return _problem(exc, str(uuid.uuid4()))
+    @router.post(
+        "/api/sessions/{alias:path}/retry",
+        dependencies=mutation_dependencies,
+    )
+    async def retry_session(alias: str) -> JSONResponse:
+        view = await session_service.retry(alias)
+        return _accepted_session_response(view, "retry_initiated")
 
     # --- SSH Config routes ---
     @router.get("/settings/ssh")
@@ -362,28 +324,25 @@ def create_routes(
             ).model_dump()
         )
 
-    @router.put("/api/ssh/config", dependencies=[Depends(require_ready)])
+    @router.put(
+        "/api/ssh/config",
+        dependencies=mutation_dependencies,
+    )
     async def put_ssh_config(
-        request: Request,
         body: SshConfigUpdateRequest,
     ) -> JSONResponse:
-        await require_auth.__call__(request)
-        await require_csrf.__call__(request)
-        try:
-            snapshot = await validate_and_save_config(
-                settings,
-                body.text,
-                body.expected_revision,
-            )
-            catalog.set_snapshot(snapshot)
-            return JSONResponse(
-                SshConfigResponse(
-                    text=body.text,
-                    revision=snapshot.revision,
-                ).model_dump()
-            )
-        except GatewayError as exc:
-            return _problem(exc, str(uuid.uuid4()))
+        snapshot = await validate_and_save_config(
+            settings,
+            body.text,
+            body.expected_revision,
+        )
+        catalog.set_snapshot(snapshot)
+        return JSONResponse(
+            SshConfigResponse(
+                text=body.text,
+                revision=snapshot.revision,
+            ).model_dump()
+        )
 
     @router.get("/api/ssh/catalog", dependencies=[Depends(require_auth)])
     async def get_ssh_catalog(request: Request) -> JSONResponse:
@@ -431,105 +390,94 @@ def create_routes(
                 )
         return JSONResponse(SshKeyInventory(keys=slots).model_dump(exclude_none=True))
 
-    @router.post("/api/ssh/keys", dependencies=[Depends(require_ready)])
+    @router.post(
+        "/api/ssh/keys",
+        dependencies=mutation_dependencies,
+    )
     async def create_key(
-        request: Request,
         name: Annotated[str, Form(...)],
         private_key: Annotated[UploadFile, File(...)],
     ) -> JSONResponse:
-        await require_auth.__call__(request)
-        await require_csrf.__call__(request)
-        try:
-            private_key_bytes = await private_key.read(settings.ssh_key_upload_max_bytes + 1)
-            if len(private_key_bytes) > settings.ssh_key_upload_max_bytes:
-                raise GatewayError(
-                    ErrorCode.SSH_KEY_INVALID,
-                    f"Private key exceeds {settings.ssh_key_upload_max_bytes} bytes",
-                    status_code=400,
-                )
-
-            metadata = await key_service.import_upload(
-                name=name,
-                private_key_bytes=private_key_bytes,
+        private_key_bytes = await private_key.read(settings.ssh_key_upload_max_bytes + 1)
+        if len(private_key_bytes) > settings.ssh_key_upload_max_bytes:
+            raise GatewayError(
+                ErrorCode.SSH_KEY_INVALID,
+                f"Private key exceeds {settings.ssh_key_upload_max_bytes} bytes",
+                status_code=400,
             )
-            public_key = await key_service.get_public_key_text(metadata.type)
-            return JSONResponse(
-                KeyUploadResponse(
-                    name=metadata.name,
-                    type=metadata.type,
-                    algorithm=metadata.algorithm,
-                    fingerprint=metadata.fingerprint,
-                    publicKey=public_key,
-                ).model_dump(),
-                status_code=201,
-            )
-        except GatewayError as exc:
-            return _problem(exc, str(uuid.uuid4()))
 
-    @router.get("/api/ssh/keys/{type}/public")
-    async def get_key_public(request: Request, type: SshKeyType) -> Response:
-        await require_auth.__call__(request)
-        try:
-            content = await key_service.get_public_key_text(type)
-            return PlainTextResponse(content, media_type="text/plain")
-        except GatewayError as exc:
-            return _problem(exc, str(uuid.uuid4()))
+        metadata = await key_service.import_upload(
+            name=name,
+            private_key_bytes=private_key_bytes,
+        )
+        public_key = await key_service.get_public_key_text(metadata.type)
+        return JSONResponse(
+            KeyUploadResponse(
+                name=metadata.name,
+                type=metadata.type,
+                algorithm=metadata.algorithm,
+                fingerprint=metadata.fingerprint,
+                publicKey=public_key,
+            ).model_dump(),
+            status_code=201,
+        )
 
-    @router.delete("/api/ssh/keys/{type}", dependencies=[Depends(require_ready)])
-    async def delete_key(request: Request, type: SshKeyType) -> Response:
-        await require_auth.__call__(request)
-        await require_csrf.__call__(request)
-        try:
-            await key_service.delete_key(type)
-            return Response(status_code=204)
-        except GatewayError as exc:
-            return _problem(exc, str(uuid.uuid4()))
+    @router.get("/api/ssh/keys/{type}/public", dependencies=[Depends(require_auth)])
+    async def get_key_public(type: SshKeyType) -> Response:
+        content = await key_service.get_public_key_text(type)
+        return PlainTextResponse(content, media_type="text/plain")
 
-    @router.post("/api/ssh/hosts/trust", dependencies=[Depends(require_ready)])
+    @router.delete(
+        "/api/ssh/keys/{type}",
+        dependencies=mutation_dependencies,
+    )
+    async def delete_key(type: SshKeyType) -> Response:
+        await key_service.delete_key(type)
+        return Response(status_code=204)
+
+    @router.post(
+        "/api/ssh/hosts/trust",
+        dependencies=mutation_dependencies,
+    )
     async def trust_host_key(
         request: Request,
         body: TrustHostKeyRequest,
     ) -> Response:
-        await require_auth.__call__(request)
-        await require_csrf.__call__(request)
-        try:
-            session = await get_session_by_alias(request.app.state.db, body.alias)
-            if session is None:
-                raise GatewayError(
-                    ErrorCode.ALIAS_NOT_FOUND,
-                    f"No session exists for alias '{body.alias}'",
-                    status_code=404,
-                )
-
-            challenge = await host_trust_service.get_challenge(session.id)
-            if challenge is None:
-                raise GatewayError(
-                    ErrorCode.SSH_HOST_TRUST_MISMATCH,
-                    "No pending host-key challenge for this session",
-                    status_code=404,
-                )
-            if (
-                challenge.alias != body.alias
-                or challenge.host != body.host
-                or challenge.port != body.port
-                or challenge.public_key != body.publicKey
-            ):
-                raise GatewayError(
-                    ErrorCode.SSH_HOST_TRUST_MISMATCH,
-                    "Submitted host/port/public key does not match the pending challenge",
-                    status_code=409,
-                )
-
-            await host_trust_service.trust(
-                session_id=session.id,
-                host=body.host,
-                port=body.port,
-                public_key=body.publicKey,
-                replace=body.replace,
+        session = await get_session_by_alias(request.app.state.db, body.alias)
+        if session is None:
+            raise GatewayError(
+                ErrorCode.ALIAS_NOT_FOUND,
+                f"No session exists for alias '{body.alias}'",
+                status_code=404,
             )
-            return Response(status_code=204)
-        except GatewayError as exc:
-            return _problem(exc, str(uuid.uuid4()))
+
+        challenge = await host_trust_service.get_challenge(session.id)
+        if challenge is None:
+            raise GatewayError(
+                ErrorCode.SSH_HOST_TRUST_MISMATCH,
+                "No pending host-key challenge for this session",
+                status_code=404,
+            )
+        if (
+            challenge.alias != body.alias
+            or challenge.host != body.host
+            or challenge.port != body.port
+            or challenge.public_key != body.publicKey
+        ):
+            raise GatewayError(
+                ErrorCode.SSH_HOST_TRUST_MISMATCH,
+                "Submitted host/port/public key does not match the pending challenge",
+                status_code=409,
+            )
+
+        await host_trust_service.trust(
+            session_id=session.id,
+            host=body.host,
+            port=body.port,
+            public_key=body.publicKey,
+            replace=body.replace,
+        )
+        return Response(status_code=204)
 
     # --- Operations ---
     @router.get("/healthz")
@@ -546,10 +494,9 @@ def create_routes(
     @router.api_route(
         "/editor/{session_id}/{rest_of_path:path}",
         methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"],
-        dependencies=[Depends(require_ready)],
+        dependencies=[Depends(require_ready), Depends(require_auth)],
     )
     async def proxy_http_route(request: Request, session_id: str, rest_of_path: str):
-        await require_auth.__call__(request)
         sid = proxy_adapter.parse_session_id(session_id)
         return await proxy_adapter.proxy_http(sid, request)
 

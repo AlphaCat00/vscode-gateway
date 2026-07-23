@@ -23,7 +23,6 @@ def _row_to_session(row: aiosqlite.Row) -> SessionRecord:
         remote_process_start_id=row["remote_process_start_id"],
         remote_executable=row["remote_executable"],
         local_port=row["local_port"],
-        tunnel_pid=row["tunnel_pid"],
         connected_clients=row["connected_clients"],
         last_connected_at=_parse_datetime(row["last_connected_at"]),
         last_disconnected_at=_parse_datetime(row["last_disconnected_at"]),
@@ -86,11 +85,11 @@ async def insert_session(db: aiosqlite.Connection, record: SessionRecord) -> Non
     await db.execute(
         """INSERT INTO sessions (
             id, alias, state, stage, remote_pid, remote_port, remote_boot_id,
-            remote_process_start_id, remote_executable, local_port, tunnel_pid,
+            remote_process_start_id, remote_executable, local_port,
             connected_clients, last_connected_at, last_disconnected_at,
             disconnect_deadline_at, error_code, error_message, close_reason,
             created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             str(record.id),
             record.alias,
@@ -102,7 +101,6 @@ async def insert_session(db: aiosqlite.Connection, record: SessionRecord) -> Non
             record.remote_process_start_id,
             record.remote_executable,
             record.local_port,
-            record.tunnel_pid,
             record.connected_clients,
             record.last_connected_at.isoformat() if record.last_connected_at else None,
             record.last_disconnected_at.isoformat() if record.last_disconnected_at else None,
@@ -175,13 +173,11 @@ async def set_remote_identity(
     await db.commit()
 
 
-async def set_tunnel_identity(
-    db: aiosqlite.Connection, session_id: str, local_port: int, tunnel_pid: int
-) -> None:
+async def set_tunnel_identity(db: aiosqlite.Connection, session_id: str, local_port: int) -> None:
     now = datetime.now(UTC).isoformat()
     await db.execute(
-        "UPDATE sessions SET local_port = ?, tunnel_pid = ?, updated_at = ? WHERE id = ?",
-        (local_port, tunnel_pid, now, session_id),
+        "UPDATE sessions SET local_port = ?, updated_at = ? WHERE id = ?",
+        (local_port, now, session_id),
     )
     await db.commit()
 
@@ -202,7 +198,7 @@ async def clear_remote_identity(db: aiosqlite.Connection, session_id: str) -> No
 async def clear_tunnel_identity(db: aiosqlite.Connection, session_id: str) -> None:
     now = datetime.now(UTC).isoformat()
     await db.execute(
-        "UPDATE sessions SET local_port = NULL, tunnel_pid = NULL, updated_at = ? WHERE id = ?",
+        "UPDATE sessions SET local_port = NULL, updated_at = ? WHERE id = ?",
         (now, session_id),
     )
     await db.commit()
@@ -213,7 +209,7 @@ async def begin_session_recovery(db: aiosqlite.Connection, session_id: str) -> b
     now = datetime.now(UTC).isoformat()
     cursor = await db.execute(
         """UPDATE sessions SET
-            stage = ?, local_port = NULL, tunnel_pid = NULL, updated_at = ?
+            stage = ?, local_port = NULL, updated_at = ?
         WHERE id = ? AND state IN ('starting', 'ready', 'error')
             AND close_reason IS NULL""",
         (SessionStage.RECOVER.value, now, session_id),
@@ -240,7 +236,7 @@ async def complete_session_recovery(
             state = ?, stage = NULL,
             remote_pid = ?, remote_port = ?, remote_boot_id = ?,
             remote_process_start_id = ?, remote_executable = ?,
-            local_port = ?, tunnel_pid = 0,
+            local_port = ?,
             error_code = NULL, error_message = NULL, updated_at = ?
         WHERE id = ? AND state IN ('starting', 'ready', 'error')
             AND close_reason IS NULL""",

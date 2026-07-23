@@ -208,10 +208,6 @@ class SshConnection:
         """Return connections ordered from the first jump to the target."""
         return self.connections
 
-    @property
-    def tunnel_pid(self) -> int:
-        return 0
-
 
 class SshConnectionService:
     """Connect using uploaded keys and gateway-owned host trust."""

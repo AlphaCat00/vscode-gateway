@@ -95,7 +95,6 @@ class SessionRecord:
     remote_executable: str | None = None
 
     local_port: int | None = None
-    tunnel_pid: int | None = None
 
     connected_clients: int = 0
     last_connected_at: datetime | None = None
@@ -154,11 +153,6 @@ class SessionView:
     ssh_host_key: HostKeyChallenge | None = None
 
 
-# Pydantic request/response models
-class LoginRequest(BaseModel):
-    password: str
-
-
 class SshConfigResponse(BaseModel):
     text: str
     revision: str
@@ -186,25 +180,6 @@ class SshKeySlot(BaseModel):
 
 class SshKeyInventory(BaseModel):
     keys: dict[SshKeyType, SshKeySlot]
-
-
-class OpenCloseResponse(BaseModel):
-    alias: str
-    status: str
-    session_id: str | None = None
-
-
-class ProblemResponse(BaseModel):
-    type: str
-    title: str
-    status: int
-    detail: str = ""
-    code: str
-    request_id: str = ""
-
-
-class WorkspaceListResponse(BaseModel):
-    workspaces: list[dict[str, object]]
 
 
 class CatalogResponse(BaseModel):
