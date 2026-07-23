@@ -111,7 +111,25 @@ If an active forwarding listener closes unexpectedly, the gateway removes the de
 
 ## Remote Runtime
 
-The gateway uploads `gateway-helper-v1.sh` to `/tmp/gateway-helper-v1.sh`. The helper manages state under `~/.vscode-gateway` and supports capability inspection, runtime inspection/installation, session start/status/stop, and cleanup.
+The gateway uploads `gateway-helper-v1.sh` to `/tmp/gateway-helper-v1.sh`. The helper manages state under `~/.vscode-gateway` and supports capability inspection, runtime inspection/installation, session start/status/stop, and cleanup. Remote state is separated into persistent alias profiles and ephemeral process sessions:
+
+```text
+~/.vscode-gateway/
+  profiles/<sha256-of-literal-alias>/
+    user-data/
+    server-data/
+  sessions/<session-id>/
+    logs/
+    server.log
+    pid
+    port
+    boot_id
+    proc_start_id
+    executable
+    process_group_id
+```
+
+Python computes the lowercase SHA-256 digest from the UTF-8 literal alias and the helper accepts only a 64-character lowercase hexadecimal profile ID. OpenVSCode receives the profile's `user-data` and `server-data` paths, while logs and process identity remain UUID-scoped. The one-active-session-per-alias rule prevents two gateway-owned processes from concurrently using one profile.
 
 For a new session the gateway:
 
@@ -125,7 +143,7 @@ For a new session the gateway:
 8. Creates an AsyncSSH local forward on gateway loopback.
 9. Verifies the proxied editor and changes the row to `ready`.
 
-OpenVSCode starts in a dedicated process group. Before signaling it, the helper verifies the saved PID against boot ID, process start ID, executable, and process-group identity, then terminates the complete group so the launch wrapper cannot leave `server-main.js` or its workers orphaned. Normal cleanup does not remove the durable row until remote absence has been confirmed. Local forwarding stops accepting before remote cleanup; the SSH connection is closed before waiting for active forwarded channels to drain. A failed host-key or authentication attempt with no persisted remote or tunnel identity is known to precede remote startup and can be closed without reconnecting.
+OpenVSCode starts in a dedicated process group. Before signaling it, the helper verifies the saved PID against boot ID, process start ID, executable, and process-group identity, then terminates the complete group so the launch wrapper cannot leave `server-main.js` or its workers orphaned. Normal cleanup removes only `sessions/<session-id>` after remote absence has been confirmed; the alias profile remains available to later session IDs. Local forwarding stops accepting before remote cleanup; the SSH connection is closed before waiting for active forwarded channels to drain. A failed host-key or authentication attempt with no persisted remote or tunnel identity is known to precede remote startup and can be closed without reconnecting.
 
 ## Session Model
 
@@ -148,7 +166,7 @@ Concurrency rules:
 
 Startup recovery uses the same validated reattachment path for `starting` and `ready` rows and for errored rows which do not record an outstanding close request. It reconnects to remote editors when identity remains valid, rebuilds and verifies local forwards, refreshes remote identity missing from a crash window, and restores disconnect timers. Sessions which cannot be recovered remain visible as errors until retry or successful cleanup.
 
-Manual retry first attempts the same reattachment when the failed session may have reached the remote host. If the exact remote process remains alive, the existing row and session UUID return to `ready`; retry never calls the remote start operation in this case. An identity mismatch leaves the row and process untouched instead of falling through to destructive retry cleanup. Pre-remote host-key failures without resource identity retain the cleanup-and-open flow. A successful normal close confirms process absence, removes the remote session metadata, and deletes the durable row, so a later open always receives a new UUID rather than reusing a closed session.
+Manual retry first attempts the same reattachment when the failed session may have reached the remote host. If the exact remote process remains alive, the existing row and session UUID return to `ready`; retry never calls the remote start operation in this case. An identity mismatch leaves the row and process untouched instead of falling through to destructive retry cleanup. Pre-remote host-key failures without resource identity retain the cleanup-and-open flow. A successful normal close confirms process absence, removes the remote session metadata, and deletes the durable row, so a later open receives a new UUID while reusing the alias profile.
 
 Forward watchers are bound to the exact `_SessionTunnel` they observe, so a stale watcher cannot tear down a replacement tunnel. Reconnect backoff does not hold the per-alias lock; each actual attempt does, allowing a close request to move the row to `stopping` between attempts and preventing recovery from overriding close intent.
 
@@ -219,7 +237,7 @@ uv run pyright
 uv run pytest
 ```
 
-Unit tests use fake AsyncSSH connections and service doubles, including explicit jump-route expansion, per-hop policy and host-key challenges, route validation, reverse-order cleanup, temporary reconnect failure, same-UUID process reattachment, identity mismatch rejection, and stale-watcher protection. API integration tests launch ephemeral OpenSSH `sshd` instances on localhost and exercise authentication, CSRF, SSH config publication, key upload, host trust, retry, real SSH negotiation, SFTP runtime installation, forwarding, HTTP proxying, close, key deletion, and sequential jump/target trust. Their default runtime archive contains a small synthetic editor so the normal suite remains fast and offline. The real-editor case also verifies that API close leaves no process whose command references the closed session ID.
+Unit tests use fake AsyncSSH connections and service doubles, including explicit jump-route expansion, per-hop policy and host-key challenges, route validation, reverse-order cleanup, temporary reconnect failure, same-UUID process reattachment, stable alias-profile derivation, identity mismatch rejection, and stale-watcher protection. API integration tests launch ephemeral OpenSSH `sshd` instances on localhost and exercise authentication, CSRF, SSH config publication, key upload, host trust, retry, real SSH negotiation, SFTP runtime installation, forwarding, HTTP proxying, close, profile persistence across different session IDs, key deletion, and sequential jump/target trust. Their default runtime archive contains a small synthetic editor so the normal suite remains fast and offline. The real-editor case also verifies that API close leaves no process whose command references the closed session ID.
 
 The same integration lifecycle can run against a real OpenVSCode release with the `real_editor` marker. Set `VSC_GATEWAY_TEST_OPENVSCODE_ARCHIVE` to a local archive, or set both `VSC_GATEWAY_TEST_OPENVSCODE_URL` and `VSC_GATEWAY_TEST_OPENVSCODE_SHA256`. `VSC_GATEWAY_TEST_OPENVSCODE_VERSION` optionally controls the runtime version tag.
 
@@ -230,4 +248,5 @@ The same integration lifecycle can run against a real OpenVSCode release with th
 - Remote helper and archive staging currently use predictable shared `/tmp` locations or `/tmp` staging paths.
 - Remote command output and SFTP operations do not yet have one uniform bounded-output and timeout policy.
 - The local forwarding port is selected before AsyncSSH binds it, leaving a small allocation race.
+- Persistent remote alias profiles do not yet have a reset or garbage-collection API.
 - Automated coverage does not currently include proxied WebSockets or browser behavior. Real OpenVSCode coverage is opt-in rather than part of the offline default suite.

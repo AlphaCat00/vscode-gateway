@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from typing import cast
 from uuid import uuid4
@@ -49,6 +50,60 @@ def _install_result(
 
 def _connection() -> asyncssh.SSHClientConnection:
     return cast(asyncssh.SSHClientConnection, object())
+
+
+@pytest.mark.asyncio
+async def test_start_uses_stable_alias_hash_for_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    commands: list[list[str]] = []
+
+    async def _run_command(
+        conn: asyncssh.SSHClientConnection,
+        argv: list[str],
+        *,
+        timeout: float,
+        stdin: bytes | None = None,
+    ) -> asyncssh.SSHCompletedProcess:
+        del conn, timeout, stdin
+        commands.append(argv)
+        return cast(
+            asyncssh.SSHCompletedProcess,
+            _CompletedProcess(
+                exit_status=0,
+                stdout=(
+                    b'{"pid":42,"port":9876,"boot_id":"boot",'
+                    b'"process_start_id":"start","executable":"/opt/node",'
+                    b'"session_dir":"/remote/session"}'
+                ),
+            ),
+        )
+
+    monkeypatch.setattr(SshConnectionService, "run_command", staticmethod(_run_command))
+    runtime = RuntimeService(make_settings(tmp_path))
+    first_id = uuid4()
+    second_id = uuid4()
+
+    await runtime.start_session(_connection(), first_id, "host-a")
+    await runtime.start_session(_connection(), second_id, "host-a")
+
+    profile_id = hashlib.sha256(b"host-a").hexdigest()
+    assert commands == [
+        [
+            "/bin/sh",
+            runtime_module.HELPER_PATH,
+            "session-start",
+            str(first_id),
+            profile_id,
+        ],
+        [
+            "/bin/sh",
+            runtime_module.HELPER_PATH,
+            "session-start",
+            str(second_id),
+            profile_id,
+        ],
+    ]
 
 
 @pytest.mark.asyncio

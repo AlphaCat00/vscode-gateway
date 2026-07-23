@@ -285,7 +285,7 @@ class SessionService:
             await self._runtime.ensure_installed(ssh_conn.conn, capabilities.platform)
 
             await update_session_stage(self._db, str(session_id), SessionStage.START_REMOTE)
-            remote = await self._runtime.start_session(ssh_conn.conn, session_id)
+            remote = await self._runtime.start_session(ssh_conn.conn, session_id, alias)
             ledger.remote_started = True
             await set_remote_identity(
                 self._db,

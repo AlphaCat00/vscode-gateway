@@ -8,6 +8,7 @@ set -euf
 # --- Configuration ---
 GATEWAY_STATE_DIR="${GATEWAY_STATE_DIR:-$HOME/.vscode-gateway}"
 RUNTIME_DIR="$GATEWAY_STATE_DIR/runtime"
+PROFILES_DIR="$GATEWAY_STATE_DIR/profiles"
 SESSIONS_DIR="$GATEWAY_STATE_DIR/sessions"
 HELPER_VERSION="1"
 
@@ -104,11 +105,18 @@ cmd_runtime_install() {
 # --- Session start ---
 cmd_session_start() {
     local session_id="$1"
+    local profile_id="$2"
     [ -n "$session_id" ] || die "missing_argument" "session_id is required"
+    [ "${#profile_id}" -eq 64 ] || die "invalid_profile_id" "profile_id must be a SHA-256 digest"
+    case "$profile_id" in
+        *[!0-9a-f]*) die "invalid_profile_id" "profile_id must be a SHA-256 digest" ;;
+    esac
 
     local session_dir="$SESSIONS_DIR/$session_id"
-    mkdir -p "$session_dir/user-data" "$session_dir/server-data" "$session_dir/logs"
-    chmod 700 "$session_dir"
+    local profile_dir="$PROFILES_DIR/$profile_id"
+    mkdir -p "$session_dir/logs" "$profile_dir/user-data" "$profile_dir/server-data"
+    chmod 700 "$session_dir" "$session_dir/logs" "$profile_dir" \
+        "$profile_dir/user-data" "$profile_dir/server-data"
 
     local openvscode_bin=""
     # set -f (noglob) is in effect; enable globbing temporarily to
@@ -125,8 +133,8 @@ cmd_session_start() {
         --port 0 \
         --server-base-path "/editor/$session_id" \
         --without-connection-token \
-        --user-data-dir "$session_dir/user-data" \
-        --server-data-dir "$session_dir/server-data" \
+        --user-data-dir "$profile_dir/user-data" \
+        --server-data-dir "$profile_dir/server-data" \
         --logsPath "$session_dir/logs" \
         --disable-telemetry \
         > "$session_dir/server.log" 2>&1 &
@@ -314,7 +322,7 @@ main() {
         capabilities)      cmd_capabilities ;;
         runtime-inspect)   require_arg "$op" "sha256" "$1"; require_arg "$op" "version" "$2"; cmd_runtime_inspect "$1" "$2" ;;
         runtime-install)   require_arg "$op" "archive" "$1"; require_arg "$op" "sha256" "$2"; require_arg "$op" "version" "$3"; cmd_runtime_install "$1" "$2" "$3" ;;
-        session-start)     require_arg "$op" "session_id" "$1"; cmd_session_start "$1" ;;
+        session-start)     require_arg "$op" "session_id" "$1"; require_arg "$op" "profile_id" "${2:-}"; cmd_session_start "$1" "$2" ;;
         session-inspect)   require_arg "$op" "session_id" "$1"; cmd_session_inspect "$1" ;;
         session-stop)      require_arg "$op" "session_id" "$1"; cmd_session_stop "$1" ;;
         session-remove)    require_arg "$op" "session_id" "$1"; cmd_session_remove "$1" ;;

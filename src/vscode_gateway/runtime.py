@@ -218,10 +218,12 @@ async def start_session(
     settings: Settings,
     conn: asyncssh.SSHClientConnection,
     session_id: uuid.UUID,
+    alias: str,
 ) -> RuntimeIdentity:
+    profile_id = hashlib.sha256(alias.encode("utf-8")).hexdigest()
     result = await SshConnectionService.run_command(
         conn,
-        ["/bin/sh", HELPER_PATH, "session-start", str(session_id)],
+        ["/bin/sh", HELPER_PATH, "session-start", str(session_id), profile_id],
         timeout=settings.startup_timeout,
     )
     if result.exit_status is None or result.exit_status != 0:
@@ -367,9 +369,12 @@ class RuntimeService:
         await ensure_installed(self.settings, conn, platform)
 
     async def start_session(
-        self, conn: asyncssh.SSHClientConnection, session_id: uuid.UUID
+        self,
+        conn: asyncssh.SSHClientConnection,
+        session_id: uuid.UUID,
+        alias: str,
     ) -> RuntimeIdentity:
-        return await start_session(self.settings, conn, session_id)
+        return await start_session(self.settings, conn, session_id, alias)
 
     async def inspect_session(
         self, conn: asyncssh.SSHClientConnection, session_id: uuid.UUID

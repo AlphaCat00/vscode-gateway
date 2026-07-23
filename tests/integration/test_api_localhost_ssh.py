@@ -680,7 +680,19 @@ async def test_api_session_lifecycle_over_real_localhost_ssh(gateway_api: Gatewa
     assert session.status_code == 200
     assert session.json()["state"] == "ready"
     remote_session_id = cast(str, session.json()["id"])
-    assert ssh.remote_state_dir.joinpath("sessions", remote_session_id).is_dir()
+    remote_session_dir = ssh.remote_state_dir.joinpath("sessions", remote_session_id)
+    profile_id = hashlib.sha256(_ALIAS.encode("utf-8")).hexdigest()
+    profile_dir = ssh.remote_state_dir.joinpath("profiles", profile_id)
+    assert remote_session_dir.is_dir()
+    assert remote_session_dir.joinpath("logs").is_dir()
+    assert not remote_session_dir.joinpath("user-data").exists()
+    assert not remote_session_dir.joinpath("server-data").exists()
+    assert profile_dir.joinpath("user-data").is_dir()
+    assert profile_dir.joinpath("server-data").is_dir()
+    user_marker = profile_dir / "user-data" / "gateway-profile-marker"
+    server_marker = profile_dir / "server-data" / "gateway-profile-marker"
+    user_marker.write_text("persistent user data", encoding="utf-8")
+    server_marker.write_text("persistent server data", encoding="utf-8")
     assert _matching_process_ids(remote_session_id)
 
     closed = await client.post(
@@ -690,6 +702,29 @@ async def test_api_session_lifecycle_over_real_localhost_ssh(gateway_api: Gatewa
     assert closed.status_code == 204
     await _wait_for_workspace_state(client, _ALIAS, "closed")
     await _wait_for_process_absence(remote_session_id)
+    assert not remote_session_dir.exists()
+    assert user_marker.read_text(encoding="utf-8") == "persistent user data"
+    assert server_marker.read_text(encoding="utf-8") == "persistent server data"
+
+    reopened = await client.post(
+        f"/api/sessions/{_ALIAS}/open",
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert reopened.status_code == 202
+    reopened_session_id = cast(str, reopened.json()["session_id"])
+    assert reopened_session_id != remote_session_id
+    await _wait_for_workspace_state(client, _ALIAS, "ready", timeout=ready_timeout)
+    assert user_marker.read_text(encoding="utf-8") == "persistent user data"
+    assert server_marker.read_text(encoding="utf-8") == "persistent server data"
+
+    reclosed = await client.post(
+        f"/api/sessions/{_ALIAS}/close",
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert reclosed.status_code == 204
+    await _wait_for_workspace_state(client, _ALIAS, "closed")
+    await _wait_for_process_absence(reopened_session_id)
+    assert profile_dir.is_dir()
 
     deleted = await client.delete(
         "/api/ssh/keys/ed25519",

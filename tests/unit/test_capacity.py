@@ -745,8 +745,9 @@ async def test_retry_reattaches_alive_process_without_changing_session_id(
         self: RuntimeService,
         connection: asyncssh.SSHClientConnection,
         session_id: SessionId,
+        alias: str,
     ) -> Any:
-        del self, connection, session_id
+        del self, connection, session_id, alias
         raise AssertionError("retry must not start a second remote process")
 
     monkeypatch.setattr(RuntimeService, "start_session", _unexpected_start)

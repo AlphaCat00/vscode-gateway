@@ -222,9 +222,12 @@ def _install_happy_open_stubs(
         return None
 
     async def _start_session(
-        self: RuntimeService, connection: asyncssh.SSHClientConnection, session_id: SessionId
+        self: RuntimeService,
+        connection: asyncssh.SSHClientConnection,
+        session_id: SessionId,
+        alias: str,
     ) -> RuntimeIdentity:
-        del connection, session_id
+        del connection, session_id, alias
         return remote or RuntimeIdentity(
             pid=4242,
             port=9876,
@@ -291,9 +294,12 @@ async def test_runtime_error_marks_internal_error_row(
     state = _install_happy_open_stubs(monkeypatch)
 
     async def _boom(
-        self: RuntimeService, connection: asyncssh.SSHClientConnection, session_id: SessionId
+        self: RuntimeService,
+        connection: asyncssh.SSHClientConnection,
+        session_id: SessionId,
+        alias: str,
     ) -> RuntimeIdentity:
-        del connection, session_id
+        del connection, session_id, alias
         raise RuntimeError("synthetic bug in remote helper")
 
     monkeypatch.setattr(RuntimeService, "start_session", _boom)
@@ -332,9 +338,12 @@ async def test_runtime_error_releases_capacity_after_close(
     _install_happy_open_stubs(monkeypatch)
 
     async def _boom(
-        self: RuntimeService, connection: asyncssh.SSHClientConnection, session_id: SessionId
+        self: RuntimeService,
+        connection: asyncssh.SSHClientConnection,
+        session_id: SessionId,
+        alias: str,
     ) -> RuntimeIdentity:
-        del connection, session_id
+        del connection, session_id, alias
         raise RuntimeError("synthetic")
 
     async def _stop(

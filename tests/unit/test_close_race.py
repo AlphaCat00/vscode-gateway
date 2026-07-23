@@ -252,9 +252,12 @@ def _install_happy_open_stubs(
         return None
 
     async def _start_session(
-        self: RuntimeService, connection: asyncssh.SSHClientConnection, session_id: SessionId
+        self: RuntimeService,
+        connection: asyncssh.SSHClientConnection,
+        session_id: SessionId,
+        alias: str,
     ) -> RuntimeIdentity:
-        del connection, session_id
+        del connection, session_id, alias
         return remote or RuntimeIdentity(
             pid=4242,
             port=9876,
