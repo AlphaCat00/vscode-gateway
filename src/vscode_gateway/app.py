@@ -27,7 +27,6 @@ from vscode_gateway.host_trust import HostTrustService
 from vscode_gateway.lockfile import ProcessLock, check_multi_worker_env
 from vscode_gateway.models import CatalogSnapshot
 from vscode_gateway.proxy import ProxyAdapter, ProxyRegistry
-from vscode_gateway.readiness import Readiness, ReadinessPhase, UnresolvedCounts
 from vscode_gateway.routes import create_routes
 from vscode_gateway.runtime import RuntimeService
 from vscode_gateway.sessions import SessionService
@@ -220,13 +219,11 @@ def _attach_services(
 async def lifespan(app: FastAPI):
     settings: Settings = app.state.settings
     logger = structlog.get_logger()
-    readiness: Readiness = app.state.readiness  # type: ignore[assignment]
 
     bg_tasks: BackgroundTaskSet = set()
     process_lock: ProcessLock | None = None
     services: _GatewayServices | None = None
 
-    # Startup failures leave the app degraded so /readyz remains available.
     try:
         # Acquire the singleton lock before opening mutable services.
         process_lock = ProcessLock(settings.state_dir)
@@ -255,56 +252,55 @@ async def lifespan(app: FastAPI):
         async def favicon() -> Response:
             return Response(status_code=204)
 
-        logger.info("running_startup_recovery")
-        readiness.begin_recovery()
         if services.catalog_snapshot.error:
             logger.error("startup_ssh_config_invalid", error=services.catalog_snapshot.error)
-            readiness.mark_degraded(
-                f"SSH config is invalid: {services.catalog_snapshot.error}", UnresolvedCounts()
+            raise RuntimeError(f"SSH config is invalid: {services.catalog_snapshot.error}")
+
+        logger.info("running_startup_recovery")
+        report = await services.session_service.recover_all()
+        logger.info(
+            "startup_recovery_complete",
+            recovered=report.recovered,
+            failed=report.failed,
+            cleaned=report.cleaned,
+            error_sessions_remaining=report.error_sessions_remaining,
+            orphaned_resources_remaining=report.orphaned_resources_remaining,
+        )
+        if report.failed or report.error_sessions_remaining or report.orphaned_resources_remaining:
+            logger.warning(
+                "startup_recovery_incomplete",
+                failed=report.failed,
+                error_sessions=report.error_sessions_remaining,
+                orphaned_resources=report.orphaned_resources_remaining,
             )
-        else:
+
+        # Uvicorn begins accepting requests only after lifespan startup yields.
+        yield
+    finally:
+        logger.info("shutting_down")
+        for task in list(bg_tasks):
+            task.cancel()
+        if bg_tasks:
+            with suppress(asyncio.CancelledError):
+                await asyncio.gather(*bg_tasks, return_exceptions=True)
+        if services is not None:
             try:
-                report = await services.session_service.recover_all()
-                logger.info(
-                    "startup_recovery_complete",
-                    recovered=report.recovered,
-                    failed=report.failed,
-                    cleaned=report.cleaned,
-                    error_sessions_remaining=report.error_sessions_remaining,
-                    orphaned_resources_remaining=report.orphaned_resources_remaining,
-                )
-                unresolved = UnresolvedCounts(
-                    error_sessions=report.error_sessions_remaining,
-                    orphaned_resources=report.orphaned_resources_remaining,
-                )
-                if unresolved.error_sessions > 0 or unresolved.orphaned_resources > 0:
-                    readiness.mark_degraded("recovery left unresolved sessions", unresolved)
-                    logger.warning(
-                        "startup_recovery_degraded",
-                        **unresolved.as_dict(),
-                    )
-                else:
-                    readiness.mark_ready()
+                await services.session_service.shutdown()
             except Exception as exc:
-                logger.error("startup_recovery_failed", error=str(exc))
-                readiness.mark_degraded(f"recovery failed: {exc}", UnresolvedCounts())
-    except Exception as exc:
-        logger.error("startup_mandatory_failed", error=str(exc))
-        readiness.fail(f"mandatory startup failed: {exc}")
-
-    yield
-
-    logger.info("shutting_down")
-    for task in list(bg_tasks):
-        task.cancel()
-    if bg_tasks:
-        await asyncio.gather(*bg_tasks, return_exceptions=True)
-    if services is not None:
-        await services.session_service.shutdown()
-        await services.http_client.aclose()
-        await services.db.close()
-    if process_lock is not None:
-        process_lock.release()
+                logger.error("session_service_shutdown_failed", error=str(exc))
+            try:
+                await services.http_client.aclose()
+            except Exception as exc:
+                logger.error("http_client_shutdown_failed", error=str(exc))
+            try:
+                await services.db.close()
+            except Exception as exc:
+                logger.error("database_shutdown_failed", error=str(exc))
+        if process_lock is not None:
+            try:
+                process_lock.release()
+            except Exception as exc:
+                logger.error("singleton_lock_release_failed", error=str(exc))
 
 
 def _make_spawner(bg_tasks: BackgroundTaskSet) -> BackgroundSpawner:
@@ -379,21 +375,6 @@ def create_app() -> FastAPI:
         middleware=middleware,
     )
     app.state.settings = settings
-    # Readiness object lives on app.state so it is accessible from the
-    # top-level /readyz route registered below (always reachable, even
-    # when the lifespan startup sequence fails before routes mount).
-    app.state.readiness = Readiness()
-
-    @app.get("/readyz", include_in_schema=False)
-    async def readyz(request: Request) -> JSONResponse:
-        readiness: Readiness = request.app.state.readiness
-        state = readiness.snapshot()
-        status_code = 200 if state.phase == ReadinessPhase.READY else 503
-        return JSONResponse(
-            state.as_response_dict(),
-            status_code=status_code,
-            media_type="application/problem+json" if status_code != 200 else "application/json",
-        )
 
     app.add_exception_handler(HTTPException, http_exception_handler)
     app.add_exception_handler(GatewayError, gateway_error_handler)

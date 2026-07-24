@@ -565,9 +565,7 @@ async def test_api_session_lifecycle_over_real_localhost_ssh(gateway_api: Gatewa
     ssh = gateway_api.ssh
 
     assert (await client.get("/healthz")).status_code == 200
-    ready = await client.get("/readyz")
-    assert ready.status_code == 200
-    assert ready.json()["phase"] == "ready"
+    assert (await client.get("/readyz")).status_code == 404
 
     for page_path in ("/", "/settings/ssh", "/settings/keys"):
         page_redirect = await client.get(page_path)

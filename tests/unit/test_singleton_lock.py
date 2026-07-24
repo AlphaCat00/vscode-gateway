@@ -21,7 +21,7 @@ from vscode_gateway.lockfile import (
     ProcessLock,
     check_multi_worker_env,
 )
-from vscode_gateway.readiness import Readiness, ReadinessPhase
+from vscode_gateway.models import RecoveryReport
 from vscode_gateway.settings import Settings
 
 _WORKER_ENV_VARS = ("UVICORN_WORKERS", "WEB_CONCURRENCY")
@@ -43,7 +43,6 @@ def _settings(tmp_path: Path) -> Settings:
 def _build_app(settings: Settings) -> FastAPI:
     app = FastAPI()
     app.state.settings = settings
-    app.state.readiness = Readiness()
     return app
 
 
@@ -198,10 +197,7 @@ def test_lifespan_second_invocation_fails_fast_when_lock_held(tmp_path: Path) ->
     asyncio.run(_hold_then_other())
 
 
-def test_lifespan_reports_degraded_when_lock_already_held(tmp_path: Path) -> None:
-    """If the lock is held by a peer before lifespan runs, the lifespan
-    must mark readiness degraded and proceed to ``yield``
-    so ``/readyz`` keeps reporting the failure."""
+def test_lifespan_fails_when_lock_already_held(tmp_path: Path) -> None:
     state_dir = tmp_path / "state"
     state_dir.mkdir()
     lock_path = state_dir / LOCK_FILE_NAME
@@ -212,15 +208,11 @@ def test_lifespan_reports_degraded_when_lock_already_held(tmp_path: Path) -> Non
         app = _build_app(settings)
 
         async def _drive() -> None:
-            async with lifespan(app):
-                readiness: Readiness = app.state.readiness  # type: ignore[assignment]
-                assert readiness.phase == ReadinessPhase.DEGRADED
-                snap = readiness.snapshot()
-                assert "singleton" in snap.reason.lower() or "mandatory" in snap.reason.lower()
-                # DB / http_client must NOT be initialized when the
-                # singleton lock could not be acquired.
-                assert getattr(app.state, "db", None) is None
-                assert getattr(app.state, "http_client", None) is None
+            with pytest.raises(LockAcquisitionError):
+                async with lifespan(app):
+                    raise AssertionError("lifespan must not start")
+            assert getattr(app.state, "db", None) is None
+            assert getattr(app.state, "http_client", None) is None
 
         asyncio.run(_drive())
     finally:
@@ -228,11 +220,9 @@ def test_lifespan_reports_degraded_when_lock_already_held(tmp_path: Path) -> Non
         os.close(fd)
 
 
-def test_lifespan_does_not_release_lock_prematurely_on_inner_error(
+def test_lifespan_releases_lock_after_recovery_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A failure during recovery (after the lock is held) must NOT
-    release the lock mid-lifespan; it stays held until shutdown."""
     settings = _settings(tmp_path)
     app = _build_app(settings)
 
@@ -242,21 +232,20 @@ def test_lifespan_does_not_release_lock_prematurely_on_inner_error(
     monkeypatch.setattr("vscode_gateway.sessions.SessionService.recover_all", _boom_recover)
 
     async def _drive() -> None:
-        async with lifespan(app):
-            lock: ProcessLock = app.state.process_lock  # type: ignore[assignment]
-            assert lock.is_held
-            # The recovery error kept us DEGRADED, but the singleton lock
-            # must still be held (this process is the legitimate owner).
-            readiness: Readiness = app.state.readiness  # type: ignore[assignment]
-            assert readiness.phase == ReadinessPhase.DEGRADED
-            # A second ProcessLock on the same state dir must fail.
-            with pytest.raises(LockAcquisitionError):
-                ProcessLock(tmp_path / "state").acquire()
+        with pytest.raises(RuntimeError, match="recovery exploded"):
+            async with lifespan(app):
+                raise AssertionError("lifespan must not start")
+
+        lock: ProcessLock = app.state.process_lock  # type: ignore[assignment]
+        assert not lock.is_held
+        replacement = ProcessLock(tmp_path / "state")
+        replacement.acquire()
+        replacement.release()
 
     asyncio.run(_drive())
 
 
-def test_lifespan_skips_recovery_when_ssh_config_is_invalid(
+def test_lifespan_fails_before_recovery_when_ssh_config_is_invalid(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     settings = _settings(tmp_path)
@@ -275,11 +264,40 @@ def test_lifespan_skips_recovery_when_ssh_config_is_invalid(
     monkeypatch.setattr("vscode_gateway.sessions.SessionService.recover_all", _fail_if_recovered)
 
     async def _drive() -> None:
+        with pytest.raises(RuntimeError, match="SSH config is invalid"):
+            async with lifespan(app):
+                raise AssertionError("lifespan must not start")
+        assert recovery_called is False
+
+        replacement = ProcessLock(tmp_path / "state")
+        replacement.acquire()
+        replacement.release()
+
+    asyncio.run(_drive())
+
+
+def test_lifespan_starts_with_per_session_recovery_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    app = _build_app(settings)
+
+    async def _recover_with_errors(self: Any) -> RecoveryReport:
+        return RecoveryReport(
+            recovered=0,
+            failed=1,
+            cleaned=0,
+            total=1,
+            error_sessions_remaining=1,
+            orphaned_resources_remaining=1,
+        )
+
+    monkeypatch.setattr("vscode_gateway.sessions.SessionService.recover_all", _recover_with_errors)
+
+    async def _drive() -> None:
         async with lifespan(app):
-            readiness: Readiness = app.state.readiness  # type: ignore[assignment]
-            assert readiness.phase == ReadinessPhase.DEGRADED
-            assert "ssh config is invalid" in readiness.snapshot().reason.lower()
-            assert recovery_called is False
+            lock: ProcessLock = app.state.process_lock  # type: ignore[assignment]
+            assert lock.is_held
 
     asyncio.run(_drive())
 

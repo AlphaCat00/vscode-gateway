@@ -44,7 +44,6 @@ from vscode_gateway.models import (
     VersionResponse,
 )
 from vscode_gateway.proxy import ProxyAdapter, ProxyRegistry
-from vscode_gateway.readiness import Readiness, ReadinessPhase
 from vscode_gateway.sessions import SessionService
 from vscode_gateway.settings import Settings
 from vscode_gateway.ssh_config import (
@@ -85,24 +84,6 @@ async def require_csrf(request: Request) -> None:
         raise HTTPException(status_code=403, detail="Invalid CSRF token")
 
 
-def require_ready(request: Request) -> None:
-    """Reject mutations and editor traffic while the gateway is not
-    ``ready``. Read-only routes (dashboard, lists, /healthz, the
-    top-level /readyz) bypass this check.
-
-    The check returns 503 with a problem+json body so load balancers
-    stop routing mutations and editors during startup and degraded
-    recovery.
-    """
-    readiness: Readiness | None = getattr(request.app.state, "readiness", None)
-    if readiness is None or not readiness.is_ready:
-        reason = readiness.snapshot().reason if readiness is not None else ""
-        raise HTTPException(
-            status_code=503,
-            detail=reason or "Service is not ready",
-        )
-
-
 def _host_key_payload(challenge: HostKeyChallenge) -> dict[str, str | int]:
     return {
         "role": challenge.role,
@@ -138,7 +119,6 @@ def create_routes(
     router = APIRouter()
     templates = _load_templates()
     mutation_dependencies = (
-        Depends(require_ready),
         Depends(require_auth),
         Depends(require_csrf),
     )
@@ -494,7 +474,7 @@ def create_routes(
     @router.api_route(
         "/editor/{session_id}/{rest_of_path:path}",
         methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"],
-        dependencies=[Depends(require_ready), Depends(require_auth)],
+        dependencies=[Depends(require_auth)],
     )
     async def proxy_http_route(request: Request, session_id: str, rest_of_path: str):
         sid = proxy_adapter.parse_session_id(session_id)
@@ -502,12 +482,6 @@ def create_routes(
 
     @router.websocket("/editor/{session_id}/{rest_of_path:path}")
     async def proxy_ws_route(ws: WebSocket, session_id: str, rest_of_path: str):
-        # Reject editor traffic while the gateway is not ready.
-        readiness: Readiness | None = getattr(ws.app.state, "readiness", None)
-        if readiness is None or readiness.phase != ReadinessPhase.READY:
-            await ws.close(code=4503)
-            return
-
         # Authenticate before accepting or contacting the upstream editor.
         if not is_authenticated(ws):
             await ws.close(code=4401)

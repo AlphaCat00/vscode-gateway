@@ -199,7 +199,6 @@ def test_app_lifespan_builds_trust_env_false_client(tmp_path: Path) -> None:
     from fastapi import FastAPI
 
     from vscode_gateway.app import lifespan
-    from vscode_gateway.readiness import Readiness
     from vscode_gateway.settings import Settings
 
     settings_kwargs: dict[str, Any] = {
@@ -215,7 +214,6 @@ def test_app_lifespan_builds_trust_env_false_client(tmp_path: Path) -> None:
     settings = Settings(**settings_kwargs)  # type: ignore[arg-type]
     app = FastAPI()
     app.state.settings = settings
-    app.state.readiness = Readiness()
 
     async def _drive() -> None:
         async with lifespan(app):

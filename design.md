@@ -75,7 +75,7 @@ Config writes:
 - reject directives which can execute local programs, establish unmanaged forwards, or override gateway-owned identity and trust
 - atomically replace the config and refresh the in-memory catalog
 
-Startup applies the same content limits and prohibited-directive checks before publishing the catalog. An invalid externally provisioned config publishes no aliases, skips SSH recovery so AsyncSSH never parses it, and leaves readiness degraded until the file is corrected and the service is restarted.
+Startup applies the same content limits and prohibited-directive checks before publishing the catalog. An invalid externally provisioned config aborts startup before SSH recovery so AsyncSSH never parses it. The file must be corrected before the gateway can start.
 
 Alias discovery is deliberately lightweight. AsyncSSH remains the authority when it resolves a selected alias and applies supported SSH config directives.
 
@@ -206,7 +206,6 @@ DELETE /api/ssh/keys/{type}
 POST   /api/ssh/hosts/trust
 
 GET    /healthz
-GET    /readyz
 GET    /api/version
 *      /editor/{session_id}/{path}
 WS     /editor/{session_id}/{path}
@@ -224,7 +223,7 @@ The SSH config page shows backend-authoritative config errors and adds best-effo
 
 ## Lifespan And Deployment
 
-Application lifespan acquires an exclusive process lock, opens and migrates SQLite, loads the SSH catalog, initializes services, runs recovery, and then reports ready. Timers and session workers belong to the lifespan task group. Shutdown rejects new work, closes sessions' local resources, drains tasks, closes shared HTTP resources and SQLite, and releases the process lock.
+Application lifespan acquires an exclusive process lock, opens and migrates SQLite, loads and validates the SSH catalog, initializes services, and runs recovery before Uvicorn accepts requests. Invalid configuration and recovery infrastructure failures abort startup; individual sessions which remain in error are non-fatal and stay available for remediation. Timers and session workers belong to the lifespan task group. Shutdown and failed startup close sessions' local resources, drain tasks, close shared HTTP resources and SQLite, and release the process lock.
 
 Run Uvicorn with one worker only. In-memory locks, connection ownership, capacity, presence, throttling, and task supervision make multi-worker deployment invalid.
 

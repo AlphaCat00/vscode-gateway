@@ -26,7 +26,6 @@ from vscode_gateway.errors import ErrorCode, GatewayError
 from vscode_gateway.host_trust import HostTrustService
 from vscode_gateway.models import CatalogSnapshot, SessionState
 from vscode_gateway.proxy import ProxyAdapter, ProxyRegistry
-from vscode_gateway.readiness import Readiness
 from vscode_gateway.routes import create_routes
 from vscode_gateway.runtime import RuntimeService
 from vscode_gateway.sessions import SessionService
@@ -69,9 +68,6 @@ async def _route_app(
         connection_service,
         trust_service,
     )
-    readiness = Readiness()
-    readiness.mark_ready()
-
     app = FastAPI(
         middleware=[
             Middleware(
@@ -82,7 +78,6 @@ async def _route_app(
         ]
     )
     app.state.settings = settings
-    app.state.readiness = readiness
     app.state.db = database
     app.add_exception_handler(GatewayError, gateway_error_handler)
     app.include_router(
